@@ -1,0 +1,13 @@
+python3 -m venv /tmp/crs_venv
+
+# Activate the virtual environment
+source /tmp/crs_venv/bin/activate
+
+# Install litellm in the virtual environment
+pip install litellm==1.69.0
+pip install tiktoken python-dotenv pyyaml chromadb openai anthropic
+pip install -q -U google-genai
+pip install google-generativeai
+pip install pycparser
+pip install clang
+pip install openlit
