@@ -53,6 +53,7 @@ type ProjectConfig struct {
 
 type CRSService interface {
     GetStatus() models.Status
+    SubmitLocalTask(taskPath string) error
     SubmitTask(task models.Task) error
     SubmitWorkerTask(task models.WorkerTask) error
     CancelTask(taskID string) error
@@ -609,6 +610,142 @@ func (s *defaultCRSService) IsWorkerBusy() (bool, []string) {
     }
     return len(activeWorkerTasks) > 0, activeIDs
 }
+
+func (s *defaultCRSService) SubmitLocalTask(taskDir string) error {
+    myFuzzer := ""
+    // --- ensure LOCAL_TEST mode is enabled ---
+    if os.Getenv("LOCAL_TEST") == "" {
+        _ = os.Setenv("LOCAL_TEST", "1")
+    }
+    
+    //----------------------------------------------------------
+    // Locate and load task_detail*.json (if present)
+    //----------------------------------------------------------
+    var (
+        taskDetail models.TaskDetail
+        jsonFound  bool
+    )
+
+    walkErr := filepath.WalkDir(taskDir, func(p string, d fs.DirEntry, err error) error {
+        if err != nil || d.IsDir() {
+            return nil // Skip errors & directories
+        }
+
+        name := d.Name()
+        if strings.HasPrefix(name, "task_detail") && strings.HasSuffix(name, ".json") {
+            data, rdErr := os.ReadFile(p)
+            if rdErr != nil {
+                log.Printf("Failed to read %s: %v (continuing search)", p, rdErr)
+                return nil
+            }
+            if umErr := json.Unmarshal(data, &taskDetail); umErr != nil {
+                log.Printf("Failed to unmarshal %s: %v (continuing search)", p, umErr)
+                return nil
+            }
+            // log.Printf("Loaded task detail from %s", p)
+            jsonFound = true
+            return filepath.SkipDir // Stop walking once we succeed
+        }
+        return nil
+    })
+    if walkErr != nil {
+        log.Printf("Directory walk error: %v", walkErr)
+    }
+
+    // Fallback to stub when JSON isn’t found / can’t be parsed
+    if !jsonFound {
+        log.Printf("No valid task_detail.json found – falling back to default task detail")
+        taskDetail = models.TaskDetail{
+            TaskID:      uuid.New(),
+            ProjectName: "test",
+            Focus:       "test",
+        }
+    }
+    //----------------------------------------------------------
+
+    // Get absolute paths
+    absTaskDir, err := filepath.Abs(taskDir)
+    if err != nil {
+        return fmt.Errorf("failed to get absolute task dir path: %v", err)
+    }
+    
+    projectDir := path.Join(absTaskDir, taskDetail.Focus)
+    dockerfilePath := path.Join(absTaskDir, "fuzz-tooling/projects",taskDetail.ProjectName)
+    dockerfileFullPath := path.Join(dockerfilePath, "Dockerfile")
+    fuzzerDir := path.Join(taskDir, "fuzz-tooling/build/out", taskDetail.ProjectName)
+
+    log.Printf("Project dir: %s", projectDir)
+    log.Printf("Dockerfile: %s", dockerfileFullPath)
+
+    cfg, sanitizerDirs, err := s.prepareTaskEnvironment(
+        &myFuzzer,
+        taskDir,
+        taskDetail,
+        dockerfilePath,
+        dockerfileFullPath,
+        fuzzerDir,
+        projectDir,
+    )
+    if err != nil {
+        return err // Or handle the error however you were before
+    }
+
+    // Collect all fuzzers from all sanitizer builds and run them in parallel
+    var allFuzzers []string
+    sanitizerDirsCopy := make([]string, len(sanitizerDirs))
+    copy(sanitizerDirsCopy, sanitizerDirs)
+    
+    // Now use the copy to find fuzzers
+    for _, sdir := range sanitizerDirsCopy {
+        fuzzers, err := s.findFuzzers(sdir)
+        if err != nil {
+            log.Printf("Warning: failed to find fuzzers in %s: %v", sdir, err)
+            continue // Skip this directory but continue with others
+        }
+
+        // Mark these fuzzers with the sanitizer directory so we know where they live
+        for _, fz := range fuzzers {
+            // We'll store the absolute path so we can directly call run_fuzzer
+            fuzzerPath := filepath.Join(sdir, fz)
+            allFuzzers = append(allFuzzers, fuzzerPath)
+        }
+    }
+
+    if len(allFuzzers) == 0 {
+        log.Printf("No fuzzers found after building all sanitizers")
+        return nil
+    }
+
+    //TODO: skip memory and undefined sanitizers if too many fuzzers
+    // keep only address sanitizer
+    const MAX_FUZZERS = 10
+    if true {
+        var allFilteredFuzzers []string
+        for _, fuzzerPath := range allFuzzers {
+            if strings.Contains(fuzzerPath, "-address/") || (strings.Contains(fuzzerPath, "-memory/") && len(allFuzzers) < MAX_FUZZERS) {
+                allFilteredFuzzers = append(allFilteredFuzzers, fuzzerPath)
+            }
+        }
+        allFuzzers = sortFuzzersByGroup(allFilteredFuzzers)
+    }
+
+    // log.Printf("Sorted fuzzers: %v", allFuzzers)
+    log.Printf("Found %d fuzzers: %v", len(allFuzzers), allFuzzers)
+
+    fullTask := models.Task{
+        MessageID:   uuid.New(),
+        MessageTime: time.Now().UnixMilli(),
+        Tasks:       []models.TaskDetail{taskDetail},
+    }
+
+    // Process the task based on its type
+    if err := s.runFuzzing(myFuzzer,taskDir, taskDetail, fullTask, cfg, allFuzzers); err != nil {
+        log.Printf("Processing task %s: %v fuzzer: %s", taskDetail.TaskID, err, myFuzzer)
+    }
+
+    return nil
+}
+
 
 func (s *defaultCRSService) SubmitTask(task models.Task) error {
     // Validate task

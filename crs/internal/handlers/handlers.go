@@ -162,6 +162,20 @@ func (h *Handler) SubmitWorkerTask(c *gin.Context) {
     c.Status(http.StatusAccepted)
 }
 
+func (h *Handler) SubmitLocalTask(taskPath string) {
+    log.Printf("SubmitLocalTask taskPath: %v", taskPath)
+
+    if os.Getenv("ANALYSIS_SERVICE_TEST") != "" || os.Getenv("LOCAL_TEST") != "" {
+        h.analysisService = "http://localhost:7082"
+    }
+    if os.Getenv("SUBMISSION_SERVICE_TEST") != "" || os.Getenv("LOCAL_TEST") != "" {
+        h.submissionService = "http://localhost:7081"
+    }
+
+    h.crs.SubmitLocalTask(taskPath)
+
+}
+
 func (h *Handler) SubmitTask(c *gin.Context) {
     var task models.Task
     if err := c.ShouldBindJSON(&task); err != nil {
