@@ -3,32 +3,36 @@ package main
 import (
     "log"
     "os"
+    "path/filepath"
     "strconv"
     "github.com/joho/godotenv"
     "crs/internal/handlers"
     "crs/internal/services"
-    "crs/internal/telemetry"
-
 )
 
 func main() {
 
-        // Check if task path is provided as first argument
-        if len(os.Args) < 2 {
-            log.Fatal("Task path is required as first argument")
-        }
-        taskPath := os.Args[1]
+    // Check if task path is provided as first argument
+    if len(os.Args) < 2 {
+        log.Fatal("Task path is required as first argument")
+    }
+    taskPath := os.Args[1]
+
+    // Get absolute paths
+    absTaskDir, err := filepath.Abs(taskPath)
+    if err != nil {
+        log.Fatal("Failed to get absolute task dir path: %v", err)
+    }
 
     // Load .env file
     if err := godotenv.Load(); err != nil {
         log.Printf("Warning: .env file not found, using default values")
     }
 
-    // Initialize telemetry
-    _, err := telemetry.InitTelemetry("afc-crs-all-you-need-is-a-fuzzing-brain-webapp-node")
-    if err != nil {
-        log.Printf("Warning: Failed to initialize telemetry: %v", err)
-    } 
+	if os.Getenv("ANTHROPIC_API_KEY") == "" {
+		log.Fatal("ANTHROPIC_API_KEY is not set")
+	}
+
     // Get credentials from environment variables with fallback values
     apiKeyID := os.Getenv("CRS_KEY_ID")
     if apiKeyID == "" {
@@ -82,5 +86,5 @@ func main() {
     // Initialize handlers with task distribution capability
     h := handlers.NewHandler(crsService, analysisService,submissionService)
    
-    h.SubmitLocalTask(taskPath)
+    h.SubmitLocalTask(absTaskDir)
 }

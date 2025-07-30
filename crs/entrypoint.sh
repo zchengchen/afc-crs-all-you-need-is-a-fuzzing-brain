@@ -16,5 +16,4 @@ while ! docker info >/dev/null 2>&1; do
 done
 echo "Docker daemon started successfully"
 
-# Run the main application
-exec ./crs-server
+exec /bin/bash
