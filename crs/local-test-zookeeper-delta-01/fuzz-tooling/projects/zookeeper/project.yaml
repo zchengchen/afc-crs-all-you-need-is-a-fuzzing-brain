@@ -1,0 +1,7 @@
+homepage: "https://github.com/apache/zookeeper"
+language: jvm
+main_repo: "https://github.com/apache/zookeeper.git"
+fuzzing_engines:
+  - libfuzzer
+sanitizers:
+  - address

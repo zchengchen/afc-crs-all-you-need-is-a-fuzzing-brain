@@ -79,6 +79,10 @@ ENV CRS_LOG_DIR=/app/logs
 
 RUN mkdir -p /crs-workdir 
 COPY ./local-test-integration-delta-01 /crs-workdir/local-test-integration-delta-01
+COPY ./local-test-libxml2-delta-01 /crs-workdir/local-test-libxml2-delta-01
+COPY ./local-test-sqlite3-full-01 /crs-workdir/local-test-sqlite3-full-01
+COPY ./local-test-tika-delta-01 /crs-workdir/local-test-tika-delta-01
+COPY ./local-test-zookeeper-delta-01 /crs-workdir/local-test-zookeeper-delta-01
 
 # Use the entrypoint script
 ENTRYPOINT ["/app/entrypoint.sh"]
