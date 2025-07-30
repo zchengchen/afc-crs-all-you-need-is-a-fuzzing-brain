@@ -82,7 +82,9 @@ GROK_MODEL = "xai/grok-3-beta"
 CLAUDE_MODEL_SONNET_4 = "claude-sonnet-4-20250514"
 CLAUDE_MODEL_OPUS_4 = "claude-opus-4-20250514"
 MODELS = [CLAUDE_MODEL, OPENAI_MODEL_O3, GEMINI_MODEL_PRO_25]
-
+CLAUDE_MODEL = CLAUDE_MODEL_SONNET_4
+OPENAI_MODEL = CLAUDE_MODEL_SONNET_4
+MODELS = [CLAUDE_MODEL_SONNET_4, CLAUDE_MODEL_OPUS_4]
 
 def get_fallback_model(current_model, tried_models):
     """Get a fallback model that hasn't been tried yet"""
@@ -2435,7 +2437,7 @@ def doPoV_full(log_file, initial_msg, fuzzer_path, fuzzer_name, sanitizer, proje
                 
                 # Submit POV to endpoint
                 submission_result = submit_pov_to_endpoint(log_file, project_dir, pov_metadata)
-                if submission_result:
+                if submission_result or True: # for local test w/o submission endpoint
                     log_message(log_file, "Successfully submitted POV to endpoint")
                 else:
                     log_message(log_file, "Failed to submit POV to endpoint")

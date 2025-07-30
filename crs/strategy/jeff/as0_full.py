@@ -74,7 +74,11 @@ GEMINI_MODEL_FLASH_LITE = "gemini-2.5-flash-lite-preview-06-17"
 GROK_MODEL = "xai/grok-3-beta"
 CLAUDE_MODEL_SONNET_4 = "claude-sonnet-4-20250514"
 CLAUDE_MODEL_OPUS_4 = "claude-opus-4-20250514"
+
 MODELS = [CLAUDE_MODEL, OPENAI_MODEL, CLAUDE_MODEL_OPUS_4, OPENAI_MODEL_O3, GEMINI_MODEL_PRO_25]
+CLAUDE_MODEL = CLAUDE_MODEL_SONNET_4
+OPENAI_MODEL = CLAUDE_MODEL_SONNET_4
+MODELS = [CLAUDE_MODEL_SONNET_4, CLAUDE_MODEL_OPUS_4]
 
 
 def get_fallback_model(current_model, tried_models):
@@ -318,6 +322,19 @@ def call_litellm(log_file, messages, model_name) -> (str, bool):
     
 
 def call_llm(log_file, messages, model_name):
+    try:
+        if model_name.startswith("gemini"):
+            response = call_gemini_api(log_file, messages, model_name)
+        else:
+            response = call_litellm(log_file, messages, model_name)
+        
+        return response
+
+    except Exception as e:
+        logging.error(f"Error in LLM call: {str(e)}")
+        return "", False
+
+def call_llm0(log_file, messages, model_name):
     """Call LLM with telemetry tracking."""    
     with tracer.start_as_current_span("genai") as span:
         span.set_attribute("crs.action.category", "fuzzing")
@@ -1609,7 +1626,7 @@ def run_fuzzer_with_coverage(log_file, fuzzer_path, project_dir, focus, sanitize
         coverage_output = ""
         fuzzer_output = filtered_output
 
-        log_fuzzer_output(log_file, fuzzer_output)
+        # log_fuzzer_output(log_file, fuzzer_output)
 
         # Check if "COVERAGE:" is in the output
         if "COVERAGE:" in filtered_output:
@@ -2466,7 +2483,7 @@ def doAdvancedPoV0(log_file, initial_msg, fuzzer_path, fuzzer_name, sanitizer, p
                 vuln_signature = fuzzer_name+"-"+generate_vulnerability_signature(crash_output, sanitizer)    
                 # Submit POV to endpoint
                 submission_result = submit_pov_to_endpoint(log_file, project_dir,blob_path,fuzzer_output,sanitizer, vuln_signature, fuzzer_name)
-                if submission_result:
+                if submission_result or True: # for local test w/o submission endpoint
                     pov_metadata = after_pov_crash_detected(log_file,model_name,iteration,fuzzer_name,sanitizer,project_name,crash_output,vuln_signature,code,blob_path,messages)
                     successful_pov_metadata = pov_metadata
                     log_message(log_file, f"POV SUCCESS! Vulnerability triggered with {model_name} on iteration {iteration}")

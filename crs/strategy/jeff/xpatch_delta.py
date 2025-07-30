@@ -74,6 +74,9 @@ MODELS = [CLAUDE_MODEL, OPENAI_MODEL, OPENAI_MODEL_O3, GEMINI_MODEL_PRO_25]
 CLAUDE_MODEL_SONNET_4 = "claude-sonnet-4-20250514"
 CLAUDE_MODEL_OPUS_4 = "claude-opus-4-20250514"
 MODELS = [CLAUDE_MODEL_OPUS_4, CLAUDE_MODEL, OPENAI_MODEL, OPENAI_MODEL_O3, GEMINI_MODEL_PRO_25]
+CLAUDE_MODEL = CLAUDE_MODEL_SONNET_4
+OPENAI_MODEL = CLAUDE_MODEL_SONNET_4
+MODELS = [CLAUDE_MODEL_SONNET_4, CLAUDE_MODEL_OPUS_4]
 
 def get_fallback_model(current_model, tried_models):
     """Get a fallback model that hasn't been tried yet"""
@@ -2655,7 +2658,7 @@ Please generate a valid patch that can be applied to the code.
                 # Submit PATCH to endpoint
                 pov_signature = f"xpatch-{project_name}"
                 submission_result = submit_patch_to_endpoint(log_file, pov_signature, patch_diff)
-                if submission_result:
+                if submission_result or True: # for local test w/o submission endpoint
                     # Save the successful patch to the main success directory
                     os.makedirs(PATCH_SUCCESS_DIR, exist_ok=True)
                     

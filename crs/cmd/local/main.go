@@ -79,8 +79,6 @@ func main() {
     crsService.SetAnalysisServiceUrl(analysisService)
     crsService.SetSubmissionEndpoint(submissionService)
 
-    log.Printf("Worker configuration: %d nodes starting at port %d", workerNodes, workerBasePort)
-
     // Initialize handlers with task distribution capability
     h := handlers.NewHandler(crsService, analysisService,submissionService)
    

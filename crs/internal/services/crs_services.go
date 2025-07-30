@@ -652,15 +652,48 @@ func (s *defaultCRSService) SubmitLocalTask(taskDir string) error {
         log.Printf("Directory walk error: %v", walkErr)
     }
 
-    // Fallback to stub when JSON isn’t found / can’t be parsed
-    if !jsonFound {
-        log.Printf("No valid task_detail.json found – falling back to default task detail")
-        taskDetail = models.TaskDetail{
-            TaskID:      uuid.New(),
-            ProjectName: "test",
-            Focus:       "test",
-        }
-    }
+	// Fallback to stub when JSON isn’t found / can’t be parsed
+	if !jsonFound {
+		log.Printf("No valid task_detail.json found – falling back to default task detail")
+
+		projectName := "test"
+		focusName := "test"
+
+		projectsDir := filepath.Join(taskDir, "fuzz-tooling/projects/")
+		files, err := os.ReadDir(projectsDir)
+		if err == nil {
+			for _, file := range files {
+				if file.IsDir() {
+					projectName = file.Name()
+					focusName = "afc-" + projectName
+					log.Printf("Found project '%s' in fuzz-tooling/projects, setting focus to '%s'", projectName, focusName)
+					break // Use the first one
+				}
+			}
+		} else {
+			log.Printf("Could not read fuzz-tooling/projects/ directory: %v", err)
+		}
+
+		// Determine task type based on presence of "diff" directory
+		taskType := models.TaskTypeFull
+		diffPath := filepath.Join(taskDir, "diff")
+		if info, err := os.Stat(diffPath); err == nil && info.IsDir() {
+			taskType = models.TaskTypeDelta
+			log.Printf("Found 'diff' directory, setting task type to 'delta'")
+		} else {
+			log.Printf("No 'diff' directory found, setting task type to 'full'")
+		}
+
+		taskDetail = models.TaskDetail{
+			TaskID:            uuid.New(),
+			ProjectName:       projectName,
+			Focus:             focusName,
+			Type:              taskType,
+			Deadline:          time.Now().Add(time.Hour).Unix(),
+			HarnessesIncluded: true,
+			Metadata:          make(map[string]string),
+		}
+	}
     //----------------------------------------------------------
 
     // Get absolute paths
@@ -1019,7 +1052,7 @@ func fileExists(p string) bool {
 
 // prepareTaskEnvironment handles all task directory setup, source extraction, and fuzzer builds.
 // It returns the sanitizer directories and project configuration.
-func (s *defaultCRSService) prepareTaskEnvironment(
+func (s *defaultCRSService) prepareTaskEnvironment0(
     myFuzzer *string,
     taskDir string,
     taskDetail models.TaskDetail,
@@ -1325,6 +1358,79 @@ func (s *defaultCRSService) prepareTaskEnvironment(
     return cfg, sanitizerDirs, nil
 }
 
+func (s *defaultCRSService) prepareTaskEnvironment(
+	myFuzzer *string,
+	taskDir string,
+	taskDetail models.TaskDetail,
+	dockerfilePath string,
+	dockerfileFullPath string,
+	fuzzerDir string,
+	projectDir string,
+) (*ProjectConfig, []string, error) {
+	var cfg *ProjectConfig
+	var sanitizerDirs []string
+
+	projectYAMLPath := filepath.Join(dockerfilePath, "project.yaml")
+	cfg, err := loadProjectConfig(projectYAMLPath)
+	if err != nil {
+		log.Printf("Warning: Could not parse project.yaml (%v). Defaulting to address sanitizer.", err)
+		cfg = &ProjectConfig{Sanitizers: []string{"address"}}
+	}
+	if len(cfg.Sanitizers) == 0 {
+		log.Printf("No sanitizers listed in project.yaml; defaulting to address sanitizer.")
+		cfg.Sanitizers = []string{"address"}
+	}
+
+	// Build fuzzers for each sanitizer if they don't exist
+	for _, sanitizer := range cfg.Sanitizers {
+		if sanitizer == "undefined" {
+			continue
+		}
+		if *myFuzzer != "" && *myFuzzer != UNHARNESSED && !strings.Contains(*myFuzzer, sanitizer) {
+			continue
+		}
+		sanitizerDir := fuzzerDir + "-" + sanitizer
+		sanitizerDirs = append(sanitizerDirs, sanitizerDir)
+
+		fuzzers, _ := s.findFuzzers(sanitizerDir)
+		// if err != nil {
+		// 	log.Printf("Warning: problem trying to find fuzzers in %s: %v", sanitizerDir, err)
+		// }
+
+		if len(fuzzers) == 0 {
+			log.Printf("No fuzzers found in %s for sanitizer %s. Building...", sanitizerDir, sanitizer)
+			if err := s.buildFuzzersDocker(myFuzzer, taskDir, projectDir, sanitizerDir, sanitizer, cfg.Language, taskDetail); err != nil {
+				log.Printf("Error building fuzzers for sanitizer %s: %v", sanitizer, err)
+			}
+		} else {
+			log.Printf("Found %d fuzzers in %s. Skipping build.", len(fuzzers), sanitizerDir)
+		}
+	}
+
+	// Coverage for C/C++ worker fuzzers
+	if os.Getenv("LOCAL_TEST") != "" || *myFuzzer != "" {
+		lang := strings.ToLower(cfg.Language)
+		if lang == "c" || lang == "c++" {
+			san := "coverage"
+			sanDir := fuzzerDir
+			fuzzers, err := s.findFuzzers(sanDir)
+			if err != nil {
+				log.Printf("Warning: problem trying to find coverage fuzzers in %s: %v", sanDir, err)
+			}
+
+			if len(fuzzers) == 0 {
+				log.Printf("Building fuzzers with --sanitizer=%s", san)
+				if err := s.buildFuzzersDocker(myFuzzer, taskDir, projectDir, sanDir, san, cfg.Language, taskDetail); err != nil {
+					log.Printf("Error building fuzzers for sanitizer %s: %v", san, err)
+				}
+			} else {
+				log.Printf("Found %d coverage fuzzers in %s. Skipping build.", len(fuzzers), sanDir)
+			}
+		}
+	}
+
+	return cfg, sanitizerDirs, nil
+}    
 func (s *defaultCRSService) processTask(myFuzzer string, taskDetail models.TaskDetail, fullTask models.Task) error {
     taskID := taskDetail.TaskID.String()
     log.Printf("Processing task %s", taskID)
@@ -4742,7 +4848,7 @@ func (s *defaultCRSService) runAdvancedPOVStrategiesWithTimeout(
     phase int,
     roundNum int,
 ) bool {
-    strategyDir := "/app/strategy"
+    strategyDir := "/app/strategyx"
     strategyFilePattern := "as*_delta.py"
     if taskDetail.Type == "full" {
         strategyFilePattern = "as*_full.py"
@@ -5055,7 +5161,7 @@ func robustCopyDir(src, dst string) error {
             
             // Create a symlink at the destination with the same target
             if err := os.Symlink(linkTarget, dstPath); err != nil {
-                log.Printf("Warning: failed to create symlink %s -> %s: %v", dstPath, linkTarget, err)
+                // log.Printf("Warning: failed to create symlink %s -> %s: %v", dstPath, linkTarget, err)
                 copyErrors = append(copyErrors, fmt.Sprintf("error creating symlink %s: %v", dstPath, err))
                 // Continue despite the error
             }
@@ -5232,7 +5338,7 @@ func (s *defaultCRSService) runXPatchingStrategiesWithoutPOV(
         log.Printf("Patch workspace fuzzer path: %s", patchFuzzerPath)
         
         // Find all strategy files under /app/strategy/
-        strategyDir := "/app/strategy"
+        strategyDir := "/app/strategyx"
         strategyFilePattern := "xpatch*_delta.py"
         if taskDetail.Type == "full" {
             strategyFilePattern = "xpatch*_full.py"
@@ -5273,7 +5379,7 @@ func (s *defaultCRSService) runXPatchingStrategiesWithoutPOV(
                 
                 {
                     // Create a symbolic link to the .env file in the task directory
-                    envFilePath := filepath.Join("/app/strategy", ".env")
+                    envFilePath := filepath.Join("/app/strategyx", ".env")
                     targetEnvPath := filepath.Join(taskDir, ".env")
                     os.Symlink(envFilePath, targetEnvPath)
                 }
@@ -5575,7 +5681,7 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
     log.Printf("Patch workspace fuzzer path: %s", patchFuzzerPath)
     
     // Find all strategy files under /app/strategy/
-    strategyDir := "/app/strategy"
+    strategyDir := "/app/strategyx"
     strategyFilePattern := "patch*_delta.py"
     if taskDetail.Type == "full" {
         strategyFilePattern = "patch*_full.py"
@@ -5680,7 +5786,7 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                 {
                     // Create a symbolic link to the .env file in the task directory
                     var symlinkCreationErr error
-                    envFilePath := filepath.Join("/app/strategy", ".env")
+                    envFilePath := filepath.Join("/app/strategyx", ".env")
                     targetEnvPath := filepath.Join(taskDir, ".env")
                     linkFi, errLstat := os.Lstat(targetEnvPath)
                     if errLstat == nil { // Path exists
@@ -5909,7 +6015,7 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
 
 func (s *defaultCRSService) runStrategies(myFuzzer, taskDir, projectDir, fuzzDir, language string, taskDetail models.TaskDetail, fullTask models.Task) bool {
     // Find all strategy files under /app/strategy/
-    strategyDir := "/app/strategy"
+    strategyDir := "/app/strategyx"
 
     strategyFilePattern := "xs*_delta.py"
     if taskDetail.Type == "full" {
@@ -5962,7 +6068,7 @@ func (s *defaultCRSService) runStrategies(myFuzzer, taskDir, projectDir, fuzzDir
             
             {
                 // Create a symbolic link to the .env file in the task directory
-                envFilePath := filepath.Join("/app/strategy", ".env")
+                envFilePath := filepath.Join("/app/strategyx", ".env")
                 targetEnvPath := filepath.Join(taskDir, ".env")
                 
                 // Remove existing symlink if it exists
@@ -6862,133 +6968,7 @@ FUZZ_LOOP:
     
     return nil
 }
-// RunStaticAnalysis runs the static analysis scan for full-scan mode
-// It returns after 5 minutes or when at least 5 vulnerabilities are found,
-// whichever comes first, but allows the scan to continue in the background.
-func RunStaticAnalysis(taskDir string, projectDir string) error {
-    log.Printf("Running static analysis for full-scan")
-    
-    suspectedVulnsPath := filepath.Join(taskDir, "suspected_vulns.json")
-    
-    // Create an empty file if it doesn't exist
-    if _, err := os.Stat(suspectedVulnsPath); os.IsNotExist(err) {
-        emptyVulns := []map[string]interface{}{}
-        vulnsData, _ := json.Marshal(emptyVulns)
-        if err := os.WriteFile(suspectedVulnsPath, vulnsData, 0644); err != nil {
-            log.Printf("Error creating empty suspected_vulns.json: %v", err)
-            return err
-        }
-    }
-    
-    // Create command to run the scan binary with incremental flag
-    scanCmd := exec.Command("/app/strategy/jeff/scan", 
-                           "-dir="+projectDir,
-                           "-suspect="+suspectedVulnsPath,
-                           "-incremental=true")
-    
-    // Set the working directory to the project directory
-    scanCmd.Dir = taskDir
-    
-    // Set environment variables
-    scanCmd.Env = os.Environ()
-    
-    // Create pipes for stdout and stderr
-    stdout, err := scanCmd.StdoutPipe()
-    if err != nil {
-        log.Printf("Error creating stdout pipe: %v", err)
-        return err
-    }
-    
-    stderr, err := scanCmd.StderrPipe()
-    if err != nil {
-        log.Printf("Error creating stderr pipe: %v", err)
-        return err
-    }
-    
-    // Start the command
-    log.Printf("Starting static analysis scan for project: %s", projectDir)
-    if err := scanCmd.Start(); err != nil {
-        log.Printf("Error starting scan: %v", err)
-        return err
-    }
-    
-    // Channel to signal when we should return
-    shouldReturn := make(chan struct{})
-    
-    // Read stdout in real-time and check for vulnerabilities
-    go func() {
-        scanner := bufio.NewScanner(stdout)
-        for scanner.Scan() {
-            line := scanner.Text()
-            // log.Printf("Scan output: %s", line)
-            
-            // Check if we have enough vulnerabilities to proceed
-            if strings.Contains(line, "Found suspicious") || strings.Contains(line, "Immediately saved suspicious") {
-                // Check the current count of vulnerabilities
-                vulnsData, err := os.ReadFile(suspectedVulnsPath)
-                if err == nil {
-                    var vulns []interface{}
-                    if err := json.Unmarshal(vulnsData, &vulns); err == nil {
-                        count := len(vulns)
-                        log.Printf("Currently have %d vulnerabilities", count)
-                        if count >= 5 {
-                            log.Printf("Found at least 5 vulnerabilities, signaling to proceed")
-                            close(shouldReturn) // Signal to return
-                            return
-                        }
-                    }
-                }
-            }
-        }
-    }()
-    
-    // Read stderr in real-time
-    go func() {
-        scanner := bufio.NewScanner(stderr)
-        for scanner.Scan() {
-            log.Printf("Scan error: %s", scanner.Text())
-        }
-    }()
-    
-    // Set up a timeout (5 minutes)
-    timeout := time.After(5 * time.Minute)
-    
-    // Wait for either:
-    // 1. Finding at least 5 vulnerabilities
-    // 2. Timeout (5 minutes)
-    select {
-    case <-shouldReturn:
-        log.Printf("Found at least 5 vulnerabilities, proceeding with strategy while scan continues")
-        
-    case <-timeout:
-        log.Printf("Scan timeout reached after 5 minutes, continuing with current results")
-    }
-    
-    // Check if we have any vulnerabilities
-    vulnsData, err := os.ReadFile(suspectedVulnsPath)
-    if err != nil {
-        log.Printf("Error reading suspected_vulns.json: %v", err)
-        return err
-    }
-    
-    var vulns []interface{}
-    if err := json.Unmarshal(vulnsData, &vulns); err != nil {
-        log.Printf("Error parsing suspected_vulns.json: %v", err)
-        return err
-    }
-    
-    vulnCount := len(vulns)
-    log.Printf("Found %d potential vulnerabilities so far", vulnCount)
-    
-    if vulnCount == 0 {
-        log.Printf("No vulnerabilities found yet, but scan continues in background")
-    }
-    
-    // Set up a file watcher to monitor for updates to the JSON file
-    go monitorVulnerabilityFile(suspectedVulnsPath)
-    
-    return nil
-}
+
 
 // monitorVulnerabilityFile watches the suspected_vulns.json file for changes
 // and logs updates as they occur
@@ -7240,15 +7220,15 @@ func copyFuzzDirForParallelStrategies(myFuzzer,fuzzDir string) error {
     isRoot := getEffectiveUserID() == 0
     if !isRoot {
         // Fix permissions using sudo
-        log.Printf("Current permissions on %s: %v", fuzzDir, info.Mode().Perm())
-        log.Printf("Attempting to fix permissions using sudo...")
+        // log.Printf("Current permissions on %s: %v", fuzzDir, info.Mode().Perm())
+        // log.Printf("Attempting to fix permissions using sudo...")
     
         // Use sudo to change ownership and permissions
         chownCmd := exec.Command("sudo", "chown", "-R", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), fuzzDir)
         if err := chownCmd.Run(); err != nil {
             log.Printf("Warning: Failed to change ownership with sudo: %v", err)
         } else {
-            log.Printf("Successfully changed ownership of %s", fuzzDir)
+            // log.Printf("Successfully changed ownership of %s", fuzzDir)
         }
     
         // Change permissions
@@ -7256,20 +7236,20 @@ func copyFuzzDirForParallelStrategies(myFuzzer,fuzzDir string) error {
         if err := chmodCmd.Run(); err != nil {
             log.Printf("Warning: Failed to change permissions with sudo: %v", err)
         } else {
-            log.Printf("Successfully changed permissions of %s", fuzzDir)
+            // log.Printf("Successfully changed permissions of %s", fuzzDir)
         }
     
         // List contents of source directory for debugging
-        files, err := os.ReadDir(fuzzDir)
-        if err != nil {
-            log.Printf("Error reading source directory contents: %v", err)
-            return fmt.Errorf("error reading source directory contents: %w", err)
-        }
+        // files, err := os.ReadDir(fuzzDir)
+        // if err != nil {
+        //     log.Printf("Error reading source directory contents: %v", err)
+        //     return fmt.Errorf("error reading source directory contents: %w", err)
+        // }
     
-        log.Printf("Source directory contains %d items:", len(files))
-        for _, file := range files {
-            log.Printf("  - %s (isDir: %v)", file.Name(), file.IsDir())
-        }
+        // log.Printf("Source directory contains %d items:", len(files))
+        // for _, file := range files {
+        //     log.Printf("  - %s (isDir: %v)", file.Name(), file.IsDir())
+        // }
     }
 
     for _, targetDir := range targetDirs {
