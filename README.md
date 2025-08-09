@@ -1,3 +1,11 @@
+# CRS Deployment
+
+> ⚠️ **Branch Information**  
+> This branch contains the **identical CRS version** used for the **aixcc final round**.  
+> For a local or single-VM test version, please switch to the **[`jeff`](../../tree/jeff)** branch.
+
+---
+
 ## CRS AKS DEPLOY:
 ```
 ./deploy-docker-images.sh
