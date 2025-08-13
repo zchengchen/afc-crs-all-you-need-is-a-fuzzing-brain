@@ -4769,7 +4769,8 @@ def main():
     parser.add_argument("--patch-workspace-dir", help="Directory for patch workspace", default="patch_workspace")
     parser.add_argument("--check-patch-success", action="store_true", 
                         help="Check for successful patches and exit early if found")
-                        
+    parser.add_argument("--model", type=str, default="", help="Specify the model to use")
+                       
     args = parser.parse_args()
     # Set global variables
     global DO_PATCH_ONLY, MAX_ITERATIONS, FUZZING_TIMEOUT_MINUTES, POV_PHASE, PATCH_PHASE
@@ -4785,6 +4786,13 @@ def main():
     POV_METADATA_DIR = args.pov_metadata_dir
     PATCH_WORKSPACE_DIR = args.patch_workspace_dir
 
+    global CLAUDE_MODEL, OPENAI_MODEL, MODELS
+    if args.model:
+        CLAUDE_MODEL = args.model
+        OPENAI_MODEL = args.model
+        MODELS = [args.model]
+    print(f"DEBUG: Global MODELS = {MODELS}")
+    
     print(f"DEBUG: Global DO_PATCH_ONLY = {DO_PATCH_ONLY}")
     print(f"DEBUG: Global FULL_SCAN = {FULL_SCAN}")
     print(f"DEBUG: Global MAX_ITERATIONS = {MAX_ITERATIONS}")

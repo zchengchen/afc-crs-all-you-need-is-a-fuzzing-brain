@@ -2951,13 +2951,7 @@ The patch did not fix the vulnerability. The fuzzer still crashes:
 Fuzzer output:
 {truncate_output(fuzzer_output, 200)}
 """
-            # Only add tests_output if it's not empty
-            if tests_output and tests_output.strip():
-                user_message += f"""
 
-Test output:
-{tests_output.split('\n')[-100:] if len(tests_output.split('\n')) > 100 else tests_output}
-"""         
             user_message += f"""
 
 Please analyze the crash and provide a better patch. 
@@ -3311,7 +3305,12 @@ def main():
     PATCHING_TIMEOUT_MINUTES = args.patching_timeout
     POV_METADATA_DIR = args.pov_metadata_dir
     PATCH_WORKSPACE_DIR = args.patch_workspace_dir
-
+    global CLAUDE_MODEL, OPENAI_MODEL, MODELS
+    if args.model:
+        CLAUDE_MODEL = args.model
+        OPENAI_MODEL = args.model
+        MODELS = [args.model]
+    print(f"DEBUG: Global MODELS = {MODELS}")
     # Add debug output after setting globals
     print(f"DEBUG: Global MAX_ITERATIONS = {MAX_ITERATIONS}")
     print(f"DEBUG: Global PATCHING_TIMEOUT_MINUTES = {PATCHING_TIMEOUT_MINUTES}")

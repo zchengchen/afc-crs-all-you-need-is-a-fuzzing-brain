@@ -4661,7 +4661,12 @@ def main():
     PATCHING_TIMEOUT_MINUTES = args.patching_timeout
     POV_METADATA_DIR = args.pov_metadata_dir
     PATCH_WORKSPACE_DIR = args.patch_workspace_dir
-
+    global CLAUDE_MODEL, OPENAI_MODEL
+    if args.model:
+        CLAUDE_MODEL = args.model
+        OPENAI_MODEL = args.model
+        MODELS = [args.model]
+    print(f"DEBUG: Global MODELS = {MODELS}")
     if TEST_NGINX== True:
         MODELS = [args.model]
         CPV = args.cpv

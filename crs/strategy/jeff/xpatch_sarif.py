@@ -3196,6 +3196,7 @@ def main():
     parser.add_argument("--patching-timeout", dest="patching_timeout", type=int,
                         default=30, help="Patching timeout in minutes")
     parser.add_argument("--patch-workspace-dir", help="Directory for patch workspace", default="patch_workspace")
+    parser.add_argument("--model", type=str, default="", help="Specify the model to use")
                         
     args = parser.parse_args()
     # Set global variables
@@ -3205,7 +3206,12 @@ def main():
     MAX_ITERATIONS = args.max_iterations
     PATCHING_TIMEOUT_MINUTES = args.patching_timeout
     PATCH_WORKSPACE_DIR = args.patch_workspace_dir
-
+    global CLAUDE_MODEL, OPENAI_MODEL
+    if args.model:
+        CLAUDE_MODEL = args.model
+        OPENAI_MODEL = args.model
+        MODELS = [args.model]
+    print(f"DEBUG: Global MODELS = {MODELS}")
     # Add debug output after setting globals
     print(f"DEBUG: Global MAX_ITERATIONS = {MAX_ITERATIONS}")
     print(f"DEBUG: Global PATCHING_TIMEOUT_MINUTES = {PATCHING_TIMEOUT_MINUTES}")

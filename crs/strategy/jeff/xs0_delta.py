@@ -2870,8 +2870,8 @@ def main():
     parser.add_argument("--patch-workspace-dir", help="Directory for patch workspace", default="patch_workspace")
     parser.add_argument("--check-patch-success", action="store_true", 
                         help="Check for successful patches and exit early if found")
-    parser.add_argument("--model", type=str, default=CLAUDE_MODEL,
-                        help="Model to use for generation")
+    parser.add_argument("--model", type=str, default="", help="Specify the model to use")
+
     parser.add_argument("--cpv", type=str, default="cpv12",
                         help="CPV number to test (e.g., cpv3, cpv5, cpv9)")
                         
@@ -2881,6 +2881,7 @@ def main():
     global PATCHING_TIMEOUT_MINUTES, POV_METADATA_DIR, PATCH_WORKSPACE_DIR, MODELS, CPV
     global FULL_SCAN
     global GLOBAL_FUNCTION_METADATA
+    global CLAUDE_MODEL, OPENAI_MODEL
 
     TEST_NGINX = args.test_nginx
     DO_PATCH = args.do_patch
@@ -2891,10 +2892,22 @@ def main():
     PATCHING_TIMEOUT_MINUTES = args.patching_timeout
     POV_METADATA_DIR = args.pov_metadata_dir
     PATCH_WORKSPACE_DIR = args.patch_workspace_dir
-
+    global CLAUDE_MODEL, OPENAI_MODEL
+    if args.model:
+        CLAUDE_MODEL = args.model
+        OPENAI_MODEL = args.model
+        MODELS = [args.model]
+    print(f"DEBUG: Global MODELS = {MODELS}")
     if TEST_NGINX== True:
         MODELS = [args.model]
         CPV = args.cpv
+
+    if args.model:
+        CLAUDE_MODEL = args.model
+        OPENAI_MODEL = args.model
+        MODELS = [args.model]
+    print(f"DEBUG: Global MODELS = {MODELS}")
+
     # Add debug output after setting globals
     print(f"DEBUG: Global TEST_NGINX = {TEST_NGINX}")
     print(f"DEBUG: Global DO_PATCH = {DO_PATCH}")

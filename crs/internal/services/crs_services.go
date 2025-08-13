@@ -1,6 +1,7 @@
 package services
 
 import (
+    "os/signal"
     "io/fs"
     "math/rand"
     "runtime"
@@ -44,6 +45,43 @@ import (
 const (
 	UNHARNESSED = "UNHARNESSED"
 )
+
+// ─── Terminal-output sanitiser ──────────────────────────────────────────
+var ansiRegexp = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
+
+func sanitizeTerminalString(s string) string {
+	// Remove ANSI colour / cursor-movement codes.
+	s = ansiRegexp.ReplaceAllString(s, "")
+
+	// Drop any remaining control characters.
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+			return -1
+		}
+		return r
+	}, s)
+
+	return strings.TrimSpace(s)
+}
+
+var (
+    childGroups   = make(map[int]struct{})
+    childGroupsMu sync.Mutex
+)
+
+func registerChildPG(pgid int) {
+    childGroupsMu.Lock()
+    childGroups[pgid] = struct{}{}
+    childGroupsMu.Unlock()
+}
+
+func killAllChildren(sig syscall.Signal) {
+    childGroupsMu.Lock()
+    for pgid := range childGroups {
+        syscall.Kill(-pgid, sig)
+    }
+    childGroupsMu.Unlock()
+}
 
 type ProjectConfig struct {
     Sanitizers []string `yaml:"sanitizers"`
@@ -89,6 +127,7 @@ type defaultCRSService struct {
     //for worker only
     workerNodes int
     workerBasePort int
+    model          string
 
     // Add these fields for tracking historical task distribution
     totalTasksDistributed int
@@ -125,7 +164,7 @@ type VulnerabilitySubmission struct {
     CrashData    []byte `json:"data_file"`
 }
 
-func NewCRSService(workerNodes int, workerBasePort int) CRSService {
+func NewCRSService(workerNodes int, workerBasePort int, model string) CRSService {
     apiEndpoint := os.Getenv("COMPETITION_API_ENDPOINT")
     if apiEndpoint == "" {
         apiEndpoint = "http://localhost:7081"  // default value
@@ -195,6 +234,7 @@ func NewCRSService(workerNodes int, workerBasePort int) CRSService {
         patchWorkDir:       "patch_workspace",
         workerNodes: workerNodes,
         workerBasePort: workerBasePort,
+        model: model,
         // Initialize the new fields
         totalTasksDistributed: 0,
 
@@ -4569,6 +4609,7 @@ func (s *defaultCRSService) runSarifPOVStrategies(myFuzzer, taskDir, sarifFilePa
                 taskDetail.ProjectName,
                 taskDetail.Focus,
                 language,
+                "--model", s.model,
                 "--do-patch=false",
                 "--pov-metadata-dir", s.povAdvcancedMetadataDir,
                 "--check-patch-success",
@@ -4737,6 +4778,7 @@ func (s *defaultCRSService) runXPatchSarifStrategies(myFuzzer, taskDir, sarifFil
                 taskDetail.ProjectName,
                 taskDetail.Focus,
                 language,
+                "--model", s.model,
                 fmt.Sprintf("--patching-timeout=%d", patchingTimeout),
                 "--patch-workspace-dir", patchWorkDir,
             }
@@ -4911,6 +4953,7 @@ func (s *defaultCRSService) runAdvancedPOVStrategiesWithTimeout(
                 taskDetail.ProjectName,
                 taskDetail.Focus,
                 language,
+                "--model", s.model,
                 "--do-patch=false",
                 "--pov-metadata-dir", s.povAdvcancedMetadataDir,
                 "--check-patch-success",
@@ -4933,7 +4976,7 @@ func (s *defaultCRSService) runAdvancedPOVStrategiesWithTimeout(
             }
 
             runCmd.Dir = taskDir
-            runCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // Kill process group on timeout
+            // runCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // Kill process group on timeout
 
             runCmd.Env = append(os.Environ(),
                 "VIRTUAL_ENV=/tmp/crs_venv",
@@ -4967,7 +5010,7 @@ func (s *defaultCRSService) runAdvancedPOVStrategiesWithTimeout(
                 return
             }
 
-            log.Printf("Running command: %s %s", pythonInterpreter, strings.Join(args, " "))
+            // log.Printf("Running command: %s %s", pythonInterpreter, strings.Join(args, " "))
             // log.Printf("With environment: %v", runCmd.Env)
 
 			startTime := time.Now()
@@ -5396,6 +5439,7 @@ func (s *defaultCRSService) runXPatchingStrategiesWithoutPOV(
                     taskDetail.ProjectName,
                     taskDetail.Focus,
                     language,
+                    "--model", s.model,
                     fmt.Sprintf("--patching-timeout=%d", patchingTimeout),
                     "--patch-workspace-dir", patchWorkDir,
                 }
@@ -5474,7 +5518,12 @@ func (s *defaultCRSService) runXPatchingStrategiesWithoutPOV(
                 go func() {
                     scanner := bufio.NewScanner(stdoutPipe)
                     for scanner.Scan() {
-                        text := scanner.Text()
+                        raw := scanner.Text()
+                        // Keep only what would be visible in a terminal (after the last CR)
+                        text := raw
+                        if i := strings.LastIndex(raw, "\r"); i >= 0 {
+                            text = raw[i+1:]
+                        }
                         outputBuffer.WriteString(text + "\n")
                         log.Printf("[XPATCH][%s stdout] %s", strategyName, text)
                         
@@ -5494,7 +5543,12 @@ func (s *defaultCRSService) runXPatchingStrategiesWithoutPOV(
                 go func() {
                     scanner := bufio.NewScanner(stderrPipe)
                     for scanner.Scan() {
-                        text := scanner.Text()
+                        raw := scanner.Text()
+                        // Keep only what would be visible in a terminal (after the last CR)
+                        text := raw
+                        if i := strings.LastIndex(raw, "\r"); i >= 0 {
+                            text = raw[i+1:]
+                        }
                         outputBuffer.WriteString(text + "\n")
                         log.Printf("[XPATCH][%s stderr] %s", strategyName, text)
                     }
@@ -5505,6 +5559,8 @@ func (s *defaultCRSService) runXPatchingStrategiesWithoutPOV(
                 case err := <-done:
                     // Process completed
                     output := outputBuffer.String()
+                       // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
                     if err != nil {
                         log.Printf("[XPATCH] Strategy %s failed after %v: %v", strategyName, time.Since(startTime), err)
                         
@@ -5533,6 +5589,9 @@ func (s *defaultCRSService) runXPatchingStrategiesWithoutPOV(
                         syscall.Kill(-pgid, syscall.SIGKILL)
                     }
                     <-done // ensure Wait() returns
+
+                       // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
                     if patchCtx.Err() == context.DeadlineExceeded {
                         log.Printf("[XPATCH] %s timed out after %v",
                              strategyName, time.Since(startTime))
@@ -5754,9 +5813,22 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
         roundCtx, cancel := context.WithTimeout(context.Background(), roundTimeoutDuration) // Context per round
         var wg sync.WaitGroup // WaitGroup per round
 
+        // install once, right after you create roundCtx
+        sigc := make(chan os.Signal, 1)
+        signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
+        go func() {
+            <-sigc
+            killAllChildren(syscall.SIGTERM)
+            time.Sleep(2 * time.Second)
+            killAllChildren(syscall.SIGKILL)
+            cancel()           // cancel roundCtx
+            fmt.Fprintln(log.Writer()) // newline so shell prompt is clean
+            os.Exit(1)         // exit the Go program itself
+        }()
+
         // patchFoundInRound := false // Track success specifically within this round
         // FIVE parallel instances for each patching strategy
-        PARALLEL_PATCH_TIMES := 2
+        PARALLEL_PATCH_TIMES := 1
         if os.Getenv("LOCAL_TEST") != "" {
             PARALLEL_PATCH_TIMES = 1
         }
@@ -5781,6 +5853,8 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                 defer wg.Done()
                 
                 strategyName := filepath.Base(strategyPath)
+                   // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
                 log.Printf("[Round %d] Running patching strategy: %s", roundNum, strategyPath)
                 
                 {
@@ -5835,6 +5909,7 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                     taskDetail.ProjectName,
                     taskDetail.Focus,
                     language,
+                    "--model", s.model,
                     fmt.Sprintf("--patching-timeout=%d", patchingTimeout),
                     "--pov-metadata-dir", povMetadataDir,
                     "--patch-workspace-dir", patchWorkDir,
@@ -5883,7 +5958,7 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                         fmt.Sprintf("NEW_FUZZER_SRC_PATH=%s", srcAny.(string)))
                 }
                 // Log the command for debugging
-                log.Printf("[Round %d] Executing: %s", roundNum, runCmd.String())
+                // log.Printf("[Round %d] Executing: %s", roundNum, runCmd.String())
                 // Create pipes for stdout and stderr
                 stdoutPipe, err := runCmd.StdoutPipe()
                 if err != nil {
@@ -5900,6 +5975,12 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                     return
                 }
                 
+                // ─── Forward Ctrl-C (SIGINT) / SIGTERM to the child process-group ───
+                if runCmd.Process != nil {
+                    pgid, _ := syscall.Getpgid(runCmd.Process.Pid) // child's pgid == pid (Setpgid:true)
+                    registerChildPG(pgid)
+                }
+
                 // Buffer for output
                 var outputBuffer bytes.Buffer
                 
@@ -5913,21 +5994,34 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                 go func() {
                     scanner := bufio.NewScanner(stdoutPipe)
                     for scanner.Scan() {
-                        text := scanner.Text()
-                        outputBuffer.WriteString(text + "\n")
-                        log.Printf("[Round %d][basic %s stdout] %s", roundNum, strategyName, text)
-                        
-                        // Check for patch success in real-time
-                        if strings.Contains(text, "PATCH SUCCESS!") || 
-                        strings.Contains(text, "Successfully patched") {                        
-                            successMutex.Lock()
-                            if !patchSuccess { // Check again under lock
-                                patchSuccess = true
-                                // patchFoundInRound = true // Mark success for this round
-                                log.Printf("[Round %d] Patch success detected for %s! Cancelling other strategies in this round.", roundNum, strategyName)
-                                cancel() // Cancel the context for this round
+                        raw := scanner.Text()
+
+                        // Handle in-line carriage returns from progress bars, etc.
+                        for _, part := range strings.Split(raw, "\r") {
+                            part = sanitizeTerminalString(part)
+                            if part == "" {
+                                continue
                             }
-                            successMutex.Unlock()
+                               // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
+                            outputBuffer.WriteString(part + "\n")
+                            log.Printf("[Round %d][basic %s stdout] %s", roundNum, strategyName, part)
+
+                            // Check for patch success in real-time
+                            if strings.Contains(part, "PATCH SUCCESS!") ||
+                                strings.Contains(part, "Successfully patched") {
+
+                                successMutex.Lock()
+                                if !patchSuccess {
+                                    patchSuccess = true
+                                       // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
+                                    log.Printf("[Round %d] Patch success detected for %s! Cancelling other strategies in this round.",
+                                        roundNum, strategyName)
+                                    cancel()
+                                }
+                                successMutex.Unlock()
+                            }
                         }
                     }
                 }()
@@ -5935,9 +6029,18 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                 go func() {
                     scanner := bufio.NewScanner(stderrPipe)
                     for scanner.Scan() {
-                        text := scanner.Text()
-                        outputBuffer.WriteString(text + "\n")
-                        log.Printf("[Round %d][basic %s stderr] %s", roundNum, strategyName, text)
+                        raw := scanner.Text()
+
+                        for _, part := range strings.Split(raw, "\r") {
+                            part = sanitizeTerminalString(part)
+                            if part == "" {
+                                continue
+                            }
+                               // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
+                            outputBuffer.WriteString(part + "\n")
+                            log.Printf("[Round %d][basic %s stderr] %s", roundNum, strategyName, part)
+                        }
                     }
                 }()
                 
@@ -5946,6 +6049,10 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                 case err := <-done:
                     // Process completed
                     output := outputBuffer.String()
+
+                       // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
+
                     if err != nil {
                         log.Printf("[Round %d] Strategy %s failed after %v: %v", roundNum, strategyName, time.Since(startTime), err)
                         
@@ -5960,6 +6067,8 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                             if !patchSuccess {
                                 patchSuccess = true
                                 // patchFoundInRound = true
+                                   // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
                                 log.Printf("[Round %d] Patch success confirmed post-run for %s. (Cancellation might have already occurred).", roundNum, strategyName)
                                 // Don't necessarily cancel again, it might already be done.
                             }
@@ -5976,6 +6085,10 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                         syscall.Kill(-pgid, syscall.SIGKILL)
                     }
                     <-done // ensure Wait() returns
+
+                       // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
+
                     if patchCtx.Err() == context.DeadlineExceeded {
                         log.Printf("[Round %d] %s timed out after %v",
                             roundNum, strategyName, time.Since(startTime))
@@ -5989,6 +6102,8 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
         
         // Wait for all strategies to complete
         wg.Wait()
+           // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
         log.Printf("Patching Attempt Round %d finished.", roundNum)
         // After the round finishes, check the global success flag again
         successMutex.Lock()
@@ -5996,6 +6111,8 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
         successMutex.Unlock()
 
         if finalRoundSuccessCheck {
+               // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
             log.Printf("Patch success confirmed after round %d. Exiting loop.", roundNum)
             break // Exit the main loop if patch was found in this round
         }
@@ -6005,11 +6122,16 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
 
     } // --- End Patching Loop ---
 
+       // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
     log.Printf("Exiting patching strategies function.")
     // Return the final state of patchSuccess
     successMutex.Lock()
     finalResult := patchSuccess
     successMutex.Unlock()
+
+    fmt.Fprintln(log.Writer())   // ensure prompt starts on a fresh line
+
     return finalResult
 }
 
@@ -6101,6 +6223,7 @@ func (s *defaultCRSService) runStrategies(myFuzzer, taskDir, projectDir, fuzzDir
                 taskDetail.ProjectName,
                 taskDetail.Focus,
                 language,
+                "--model", s.model,
                 "--pov-metadata-dir", s.povMetadataDir0,
                 "--check-patch-success",
             }
@@ -6125,7 +6248,7 @@ func (s *defaultCRSService) runStrategies(myFuzzer, taskDir, projectDir, fuzzDir
                 runCmd = exec.CommandContext(strategyCtx,pythonInterpreter, args...)
             }
             // Log the command for debugging
-            log.Printf("Executing command: %s", runCmd.String())
+            // log.Printf("Executing command: %s", runCmd.String())
             runCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
             runCmd.Dir = taskDir
             // Set environment variables that would be set by the virtual environment activation
@@ -6186,7 +6309,12 @@ func (s *defaultCRSService) runStrategies(myFuzzer, taskDir, projectDir, fuzzDir
             go func() {
                 scanner := bufio.NewScanner(stdoutPipe)
                 for scanner.Scan() {
-                    text := scanner.Text()
+                    raw := scanner.Text()
+                        // Keep only what would be visible in a terminal (after the last CR)
+                        text := raw
+                        if i := strings.LastIndex(raw, "\r"); i >= 0 {
+                            text = raw[i+1:]
+                        }
                     outputBuffer.WriteString(text + "\n")
                     log.Printf("[basic %s stdout] %s", strategyName, text)
                 }
@@ -6195,7 +6323,12 @@ func (s *defaultCRSService) runStrategies(myFuzzer, taskDir, projectDir, fuzzDir
             go func() {
                 scanner := bufio.NewScanner(stderrPipe)
                 for scanner.Scan() {
-                    text := scanner.Text()
+                    raw := scanner.Text()
+                        // Keep only what would be visible in a terminal (after the last CR)
+                        text := raw
+                        if i := strings.LastIndex(raw, "\r"); i >= 0 {
+                            text = raw[i+1:]
+                        }
                     outputBuffer.WriteString(text + "\n")
                     log.Printf("[basic %s stderr] %s", strategyName, text)
                 }
@@ -6667,6 +6800,10 @@ func waitForFile(filePath string, timeoutSeconds int) bool {
 }
 
 func (s *defaultCRSService) runLibFuzzer(myFuzzer,taskDir string, projectDir string, language string, taskDetail models.TaskDetail, fullTask models.Task) error {
+    if true {
+        log.Printf("Skipped [runLibFuzzer] for local testing: %s]", myFuzzer)
+        return nil
+    }
     // Create a span for fuzzer execution
     ctx := context.Background()
     _, fuzzerSpan := telemetry.StartSpan(ctx, "libfuzzer_execution")
@@ -7435,7 +7572,8 @@ func (s *defaultCRSService) runFuzzing(myFuzzer,taskDir string, taskDetail model
                     s.runLibFuzzer(myFuzzer, taskDir, projectDir, cfg.Language, taskDetail, fullTask)
                 } ()
             }
-            go func() {
+            
+            // go func() {
                 log.Printf("BASIC PHASE started...")
                 // 30 mins
                 _, basicPhasesSpan := telemetry.StartSpan(ctx, "llm_basic_phase")
@@ -7447,12 +7585,13 @@ func (s *defaultCRSService) runFuzzing(myFuzzer,taskDir string, taskDetail model
                 defer basicPhasesSpan.End()
 
                 if os.Getenv("FUZZER_TEST") == "" {
-                    pov_success = s.runStrategies(myFuzzer,taskDir, projectDir, fuzzDir, cfg.Language, taskDetail, fullTask)
-                } else {
-                    // for testing and then exit
-                    s.runLibFuzzer(myFuzzer,taskDir, projectDir, cfg.Language, taskDetail, fullTask)
-                    os.Exit(0)
+                     pov_success = s.runStrategies(myFuzzer,taskDir, projectDir, fuzzDir, cfg.Language, taskDetail, fullTask)
+                } else {    
+                     // for testing and then exit
+                     s.runLibFuzzer(myFuzzer,taskDir, projectDir, cfg.Language, taskDetail, fullTask)
+                     os.Exit(0)
                 }
+                
                 if pov_success {
                     povFound.Do(func() { close(povChan) })
                 } else {
@@ -7463,7 +7602,7 @@ func (s *defaultCRSService) runFuzzing(myFuzzer,taskDir string, taskDetail model
                         } ()
                     }
                 }
-            }()
+            // }()
 
              // Calculate time budget based on deadline
              deadlineTime := time.Unix(taskDetail.Deadline/1000, 0)
@@ -7485,7 +7624,7 @@ func (s *defaultCRSService) runFuzzing(myFuzzer,taskDir string, taskDetail model
              //     //should be ~12h for final
              // }           
             workingBudgetMinutes := totalBudgetMinutes - safetyBufferMinutes
-            sequentialTestRun := false          
+            sequentialTestRun := true          
             go func()  {
                 // if pov failed, run continous fuzzing w/ load seeds every 10mins
                 log.Printf("ADVANCED PHASES started...")
@@ -7807,6 +7946,8 @@ func (s *defaultCRSService) runFuzzing(myFuzzer,taskDir string, taskDetail model
                 return errors.New("Failed to find POV within deadline")
             }
 
+               // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
             if patch_success {
                 log.Printf("JOB DONE! %s", myFuzzer)
                 return nil
