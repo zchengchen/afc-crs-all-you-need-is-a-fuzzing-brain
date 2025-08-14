@@ -4613,6 +4613,8 @@ def extract_vulnerable_functions(reachable_funcs, vulnerable_functions, limit=10
     return filtered
 
 def main():
+    global CLAUDE_MODEL, OPENAI_MODEL
+
     parser = argparse.ArgumentParser(description="Strategy 0: LLM-guided POV Generation")
     parser.add_argument("fuzzer_path", help="Path to the fuzzer")
     parser.add_argument("project_name", help="Project name")
@@ -4660,7 +4662,6 @@ def main():
     PATCHING_TIMEOUT_MINUTES = args.patching_timeout
     POV_METADATA_DIR = args.pov_metadata_dir
     PATCH_WORKSPACE_DIR = args.patch_workspace_dir
-    global CLAUDE_MODEL, OPENAI_MODEL
     if args.model:
         CLAUDE_MODEL = args.model
         OPENAI_MODEL = args.model

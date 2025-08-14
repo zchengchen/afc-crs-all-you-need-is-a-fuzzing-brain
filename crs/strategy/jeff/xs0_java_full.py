@@ -4614,6 +4614,7 @@ def extract_vulnerable_functions(reachable_funcs, vulnerable_functions, limit=10
     return filtered
 
 def main():
+    global CLAUDE_MODEL, OPENAI_MODEL
     parser = argparse.ArgumentParser(description="Strategy 0: LLM-guided POV Generation")
     parser.add_argument("fuzzer_path", help="Path to the fuzzer")
     parser.add_argument("project_name", help="Project name")

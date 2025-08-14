@@ -5112,6 +5112,7 @@ def process_vulnerable_function(vf, reachable_vul_funcs, fuzzer_code, sanitizer,
     return vul_name, pov_success, pov_metadata
 
 def main():
+    global CLAUDE_MODEL, OPENAI_MODEL
     parser = argparse.ArgumentParser(description="Strategy 0: LLM-guided POV Generation")
     parser.add_argument("fuzzer_path", help="Path to the fuzzer")
     parser.add_argument("project_name", help="Project name")
@@ -5159,7 +5160,6 @@ def main():
     PATCHING_TIMEOUT_MINUTES = args.patching_timeout
     POV_METADATA_DIR = args.pov_metadata_dir
     PATCH_WORKSPACE_DIR = args.patch_workspace_dir
-    global CLAUDE_MODEL, OPENAI_MODEL
     if args.model:
         CLAUDE_MODEL = args.model
         OPENAI_MODEL = args.model
