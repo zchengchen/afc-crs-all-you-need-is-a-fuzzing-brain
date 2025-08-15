@@ -121,10 +121,10 @@
     # ------------------------------------------------------
     # Build and copy SVF binaries
     # ------------------------------------------------------
-    COPY SVF/build/bin/wpa /app/strategyx/jeff/wpa
-    COPY SVF/build/bin/fundef-bc /app/strategyx/jeff/fundef-bc
-    COPY SVF/build/lib/extapi.bc /usr/local/lib/extapi.bc
-    COPY SVF/build/lib/extapi.bc /app/strategyx/jeff/extapi.bc
+    COPY wpa /app/strategyx/jeff/wpa
+    COPY fundef-bc /app/strategyx/jeff/fundef-bc
+    COPY extapi.bc /usr/local/lib/extapi.bc
+    COPY extapi.bc /app/strategyx/jeff/extapi.bc
 
     COPY parse_callgraph.py /app/strategyx/jeff/parse_callgraph.py
     COPY parse_callgraph_full.py /app/strategyx/jeff/parse_callgraph_full.py
