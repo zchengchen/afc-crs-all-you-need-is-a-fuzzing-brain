@@ -59,6 +59,7 @@ WORKDIR /app
 
 # Copy the binary from the builder stage
 COPY --from=builder /app/crs-local .
+COPY --from=builder /app/static-analysis-local .
 
 # Copy the VERSION file from the builder stage
 COPY --from=builder /app/VERSION .

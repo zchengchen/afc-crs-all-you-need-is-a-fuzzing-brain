@@ -1,7 +1,7 @@
 ## Test LOCAL CRS:
 
 ```
-docker run -it --rm --privileged ghcr.io/parasol-aser/crs-local:latest
+docker run -it --rm --privileged crs-local:latest
 ```
 ```
 export ANTHROPIC_API_KEY=...
