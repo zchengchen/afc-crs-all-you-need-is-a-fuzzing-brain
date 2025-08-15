@@ -3035,6 +3035,11 @@ func EngineMainAnalysis(taskDetail models.TaskDetail) (models.AnalysisResults, e
 
 	taskID := taskDetail.TaskID.String()
 	taskDir := path.Join(WORK_DIR, taskID)
+	return EngineMainAnalysisCore(taskDetail,taskDir)
+}
+
+func EngineMainAnalysisCore(taskDetail models.TaskDetail, taskDir string) (models.AnalysisResults, error) {
+	
 	outputJson :=  path.Join(taskDir, fmt.Sprintf("%s.json", taskDetail.Focus))
 
 	results := models.AnalysisResults{
@@ -3192,7 +3197,7 @@ func EngineMainAnalysis(taskDetail models.TaskDetail) (models.AnalysisResults, e
 							 log.Printf("Failed to clone oss-fuzz and main repo for unharnessed task %s %s", taskDetail.ProjectName, taskDetail.TaskID)
 							 
 							 if  taskDetail.ProjectName == "integration-test" {
-								 srcPath := "/app/strategy/jeff/integration-test"
+								 srcPath := "/app/strategyx/jeff/integration-test"
 								 log.Printf("[INTEGRATION_TEST] dockerfilePath %s missing – copying from %s", dockerfilePath, srcPath)
 	 
 								 if err := robustCopyDir(srcPath, dockerfilePath); err != nil {
@@ -3267,13 +3272,51 @@ func EngineMainAnalysis(taskDetail models.TaskDetail) (models.AnalysisResults, e
 			// }
 			//only do address
 			cfg.Sanitizers = []string{"address"}
-
+			var fuzzers []string
             for _, sanitizer := range cfg.Sanitizers {
                 sanitizerDir := fuzzerDir + "-" + sanitizer
                 // Keep track of each sanitizer's output path
                 sanitizerDirs = append(sanitizerDirs, sanitizerDir)
+
+				fuzzers, _ = findFuzzers(sanitizerDir)
             }
+
+			//if compile_commands.json does not exist, still run buildFuzzersDocker
+			compileCommandsPath := filepath.Join(fuzzerDir+"-address", "compile_commands.json")
+			if len(fuzzers) == 0 || (language == "c" && !fileExists(compileCommandsPath)) {
+
+				buildOutput, err := BuildDockerImage(dockerfilePath, dockerfileFullPath, taskDetail.ProjectName)
+				if err != nil {
+					log.Printf("Docker build failed. buildOutput: %s", buildOutput)
+					log.Printf("Try building with PullAFCDockerImage")
+					buildOutputAFC, err := PullAFCDockerImage(taskDir, taskDetail.ProjectName) 
+					if err != nil {
+						return results, fmt.Errorf("Failed to build Docker image: %w\nbuildOutputAFC: %s", err, buildOutputAFC)
+					}
+				}
+
+				var wg sync.WaitGroup
+				// For each sanitizer in the YAML, run build_fuzzers
+				for _, sanitizer := range cfg.Sanitizers {
+					sanitizerDir := fuzzerDir + "-" + sanitizer
+						// Capture loop variables
+						san := sanitizer
+						wg.Add(1)
+						go func() {
+							defer wg.Done()
+							log.Printf("Building fuzzers with --sanitizer=%s", san)
+							if err := buildFuzzersDocker(taskDir, projectDir, sanitizerDir, sanitizer, cfg.Language, taskDetail.ProjectName); err != nil {
+								log.Printf("Error building fuzzers for sanitizer %s: %v", san, err)
+								// We're ignoring errors here, which is not ideal
+							}
+						}()  
+				}
+				// Wait for all builds to complete
+				wg.Wait()
+			}
         }
+		var codeqlWg sync.WaitGroup
+
 		var allFuzzers []string
 
 		for _, sdir := range sanitizerDirs {
@@ -3383,7 +3426,9 @@ func EngineMainAnalysis(taskDetail models.TaskDetail) (models.AnalysisResults, e
 
 			// FORK A NEW THREAD TO BUILD CODEQL FULL CODE PATHS
 			// When done, save data to a *_qx.json
+			codeqlWg.Add(1)
 			go func(){
+				defer codeqlWg.Done()
 				EngineMainAnalysisCodeql(taskDetail,taskDir,projectDir,dockerfilePath,javaFuzzerSourceFiles)
 			}()
 
@@ -3497,6 +3542,8 @@ func EngineMainAnalysis(taskDetail models.TaskDetail) (models.AnalysisResults, e
 
 			ProcessAllFuzzersParallel(allFuzzers, projectDir, taskDetail.ProjectName, language, &results)
 		}
+		
+		codeqlWg.Wait()
 
 		if true {
 			fmt.Printf("Saving results to %s\n", outputJson)
@@ -3675,7 +3722,7 @@ func extractPaths(results *models.AnalysisResults, mu *sync.Mutex, cps []models.
 	return all
 }
 func findAllReachableCFunctions(dotFile string) []string {
-    cmd := exec.Command("python3", "/app/strategy/jeff/parse_callgraph_full.py", dotFile)
+    cmd := exec.Command("python3", "/app/strategyx/jeff/parse_callgraph_full.py", dotFile)
     cmd.Dir = filepath.Dir(dotFile) // json will be written here
     if err := cmd.Run(); err != nil {
         log.Printf("[findAllReachableCFunctions failed] parse_callgraph_full.py %s %v", dotFile, err)
@@ -3706,7 +3753,7 @@ func findAllReachableCFunctions(dotFile string) []string {
 func CopyExtAPIFileIfNotExists() error {
 
 	dst := "/usr/local/lib/extapi.bc"
-	src := "/app/strategy/jeff/extapi.bc"
+	src := "/app/strategyx/jeff/extapi.bc"
 
     if _, err := os.Stat(dst); os.IsNotExist(err) {
         // Open the source file
@@ -3755,7 +3802,7 @@ func BuildCallGraphFromBC(fuzzer string, workDir string) error {
 	//----------------------------------------------------------------------
 	// 1. run fundef-bc to generate <fuzzer>_function_metadata.json
 	//----------------------------------------------------------------------
-	fundefCmd := exec.Command("/app/strategy/jeff/fundef-bc", fuzzerBc)
+	fundefCmd := exec.Command("/app/strategyx/jeff/fundef-bc", fuzzerBc)
 	fundefCmd.Dir = workDir
 
 	// fmt.Printf("[DEBUG] fundef-bc cwd: %s\n", fundefCmd.Dir)
@@ -3799,7 +3846,7 @@ func BuildCallGraphFromBC(fuzzer string, workDir string) error {
 
 	wpaSuccess := false
 	log.Printf("Running type-based pointer analysis for %s", fuzzerBc)
-	wpaTypeCmd := exec.Command("/app/strategy/jeff/wpa", "-type", "-dump-callgraph", fuzzerBc)
+	wpaTypeCmd := exec.Command("/app/strategyx/jeff/wpa", "-type", "-dump-callgraph", fuzzerBc)
 	wpaTypeCmd.Dir = workDir
 	if err := runWithTimeout(wpaTypeCmd, 10*time.Minute); err != nil {
 		log.Printf("Warning: wpa analysis failed for %s: %v", fuzzerBc, err)
@@ -3840,7 +3887,7 @@ func BuildCallGraphFromBC(fuzzer string, workDir string) error {
 				continue
 			}
 
-			wpa := exec.Command("/app/strategy/jeff/wpa", "-type", "-dump-callgraph", tmpBc)
+			wpa := exec.Command("/app/strategyx/jeff/wpa", "-type", "-dump-callgraph", tmpBc)
 			wpa.Dir = workDir
 			if err := runWithTimeout(wpa, 5*time.Minute); err != nil {
 				log.Printf("WPA timed-out/failed on %s: %v", bundle, err)
@@ -5369,13 +5416,13 @@ func EngineMainCodeql(request models.AnalysisRequest) ([]models.CallPath, error)
 	}
 	
 	// Create temporary query directory under myqueries
-	queriesDir := filepath.Join("/app/strategy/jeff/my-queries", "temp-call-"+taskID+"-"+fuzzerName)
+	queriesDir := filepath.Join("/app/strategyx/jeff/my-queries", "temp-call-"+taskID+"-"+fuzzerName)
 	if err := os.MkdirAll(queriesDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create temp queries directory: %v", err)
 	}
 	
 	// Read query template
-	templatePath := filepath.Join("/app/strategy/jeff/my-queries", "callpath-template.ql")
+	templatePath := filepath.Join("/app/strategyx/jeff/my-queries", "callpath-template.ql")
 	templateContent, err := os.ReadFile(templatePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read query template: %v", err)
@@ -6051,7 +6098,7 @@ func EngineMainAnalysisCodeql(taskDetail models.TaskDetail, taskDir, projectDir,
 	// --- End Database Copying ---
 
 	// Read the template file
-	templatePath := filepath.Join("/app/strategy/jeff/my-queries", "call-template.ql")
+	templatePath := filepath.Join("/app/strategyx/jeff/my-queries", "call-template.ql")
 	templateContent, err := os.ReadFile(templatePath)
 	if err != nil {
 		return results, fmt.Errorf("failed to read template file: %v", err)
@@ -6080,7 +6127,7 @@ func EngineMainAnalysisCodeql(taskDetail models.TaskDetail, taskDir, projectDir,
 		log.Printf("Processing fuzzer: %s", fuzzerName)
 		
 		// Create the query directory
-		queriesDir := filepath.Join("/app/strategy/jeff/my-queries", "temp-call-"+taskID+"-"+fuzzerName)
+		queriesDir := filepath.Join("/app/strategyx/jeff/my-queries", "temp-call-"+taskID+"-"+fuzzerName)
 		if err := os.MkdirAll(queriesDir, 0755); err != nil {
 			log.Printf("failed to create queries directory: %v", err)
 			return 
@@ -7367,7 +7414,7 @@ func GetCCallPathsParallel(projectDir, fuzzerPath, callGraph_dot string, entryPo
 			defer func() { <-semaphore }()
 
 			var stdout, stderr bytes.Buffer
-			testCmd := exec.Command("python3", "/app/strategy/jeff/parse_callgraph.py", callGraph_dot, targetFuncName)
+			testCmd := exec.Command("python3", "/app/strategyx/jeff/parse_callgraph.py", callGraph_dot, targetFuncName)
 			testCmd.Stdout = &stdout
 			testCmd.Stderr = &stderr
 
@@ -7531,7 +7578,7 @@ func GetCCallPaths(projectDir, fuzzerPath string, callGraph_dot string, targetFu
 	for _, targetFuncName := range targetFunctionNames {
 		var stdout, stderr bytes.Buffer
 
-		testCmd := exec.Command("python3", "/app/strategy/jeff/parse_callgraph.py", callGraph_dot, targetFuncName)
+		testCmd := exec.Command("python3", "/app/strategyx/jeff/parse_callgraph.py", callGraph_dot, targetFuncName)
 		testCmd.Stdout = &stdout
 		testCmd.Stderr = &stderr
 		
