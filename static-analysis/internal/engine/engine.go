@@ -7000,6 +7000,7 @@ func EngineMainQueryQX(request models.AnalysisRequest, results *models.CodeqlAna
 			}
 		}
 		projectDir := path.Join(WORK_DIR, request.TaskID, request.Focus)
+		projectDir = request.ProjectSourceDir
 		fuzzerSourcePath := normaliseAnalysisPath(request.FuzzerSourcePath)
 		
 
@@ -7030,6 +7031,8 @@ func EngineMainQuery(request models.AnalysisRequest, results *models.AnalysisRes
 			}
 		}
 		projectDir := path.Join(WORK_DIR, request.TaskID, request.Focus)
+		projectDir = request.ProjectSourceDir
+
 		fuzzerSourcePath := normaliseAnalysisPath(request.FuzzerSourcePath)
 		
 

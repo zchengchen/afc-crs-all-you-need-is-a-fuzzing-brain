@@ -90,7 +90,7 @@ func main() {
 
 	analysisService := os.Getenv("ANALYSIS_SERVICE")
 	if analysisService == "" {
-		analysisService = "http://crs-analysis"
+		analysisService = "http://localhost:7082"
 	}
 
 	if os.Getenv("ANALYSIS_SERVICE_TEST") != "" || os.Getenv("LOCAL_TEST") != "" {

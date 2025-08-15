@@ -7624,7 +7624,7 @@ func (s *defaultCRSService) runFuzzing(myFuzzer,taskDir string, taskDetail model
              //     //should be ~12h for final
              // }           
             workingBudgetMinutes := totalBudgetMinutes - safetyBufferMinutes
-            sequentialTestRun := true          
+            sequentialTestRun := false          
             go func()  {
                 // if pov failed, run continous fuzzing w/ load seeds every 10mins
                 log.Printf("ADVANCED PHASES started...")
