@@ -10,5 +10,5 @@ cd ../crs
 
 # Build the Docker image
 docker build -f Dockerfile.local -t crs-local:latest .
-# docker tag crs-local:latest ghcr.io/parasol-aser/crs-local:latest
-# docker push ghcr.io/parasol-aser/crs-local:latest
+# docker tag crs-local:latest ghcr.io/o2lab/crs-local:latest
+# docker push ghcr.io/o2lab/crs-local:latest

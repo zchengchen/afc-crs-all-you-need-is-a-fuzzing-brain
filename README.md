@@ -1,7 +1,9 @@
 ## Test LOCAL CRS:
 
 ```
-docker run -it --rm --privileged crs-local:latest
+docker pull ghcr.io/o2lab/crs-local:latest
+docker tag ghcr.io/o2lab/crs-local:latest crs-local
+docker run -it --rm --privileged crs-local
 ```
 ```
 export ANTHROPIC_API_KEY=...
