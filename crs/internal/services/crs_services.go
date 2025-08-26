@@ -1,6 +1,7 @@
 package services
 
 import (
+    "os/signal"
     "io/fs"
     "math/rand"
     "runtime"
@@ -45,10 +46,48 @@ const (
 	UNHARNESSED = "UNHARNESSED"
 )
 
+// ─── Terminal-output sanitiser ──────────────────────────────────────────
+var ansiRegexp = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
+
+func sanitizeTerminalString(s string) string {
+	// Remove ANSI colour / cursor-movement codes.
+	s = ansiRegexp.ReplaceAllString(s, "")
+
+	// Drop any remaining control characters.
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+			return -1
+		}
+		return r
+	}, s)
+
+	return strings.TrimSpace(s)
+}
+
+var (
+    childGroups   = make(map[int]struct{})
+    childGroupsMu sync.Mutex
+)
+
+func registerChildPG(pgid int) {
+    childGroupsMu.Lock()
+    childGroups[pgid] = struct{}{}
+    childGroupsMu.Unlock()
+}
+
+func killAllChildren(sig syscall.Signal) {
+    childGroupsMu.Lock()
+    for pgid := range childGroups {
+        syscall.Kill(-pgid, sig)
+    }
+    childGroupsMu.Unlock()
+}
+
 type ProjectConfig struct {
     Sanitizers []string `yaml:"sanitizers"`
     Language string  `yaml:"language"`
     MainRepo string `yaml:"main_repo"`
+    Fuzzer string `yaml:"fuzzer"`
 }
 
 type CRSService interface {
@@ -89,6 +128,7 @@ type defaultCRSService struct {
     //for worker only
     workerNodes int
     workerBasePort int
+    model          string
 
     // Add these fields for tracking historical task distribution
     totalTasksDistributed int
@@ -125,7 +165,7 @@ type VulnerabilitySubmission struct {
     CrashData    []byte `json:"data_file"`
 }
 
-func NewCRSService(workerNodes int, workerBasePort int) CRSService {
+func NewCRSService(workerNodes int, workerBasePort int, model string) CRSService {
     apiEndpoint := os.Getenv("COMPETITION_API_ENDPOINT")
     if apiEndpoint == "" {
         apiEndpoint = "http://localhost:7081"  // default value
@@ -195,6 +235,7 @@ func NewCRSService(workerNodes int, workerBasePort int) CRSService {
         patchWorkDir:       "patch_workspace",
         workerNodes: workerNodes,
         workerBasePort: workerBasePort,
+        model: model,
         // Initialize the new fields
         totalTasksDistributed: 0,
 
@@ -652,15 +693,48 @@ func (s *defaultCRSService) SubmitLocalTask(taskDir string) error {
         log.Printf("Directory walk error: %v", walkErr)
     }
 
-    // Fallback to stub when JSON isn’t found / can’t be parsed
-    if !jsonFound {
-        log.Printf("No valid task_detail.json found – falling back to default task detail")
-        taskDetail = models.TaskDetail{
-            TaskID:      uuid.New(),
-            ProjectName: "test",
-            Focus:       "test",
-        }
-    }
+	// Fallback to stub when JSON isn’t found / can’t be parsed
+	if !jsonFound {
+		log.Printf("No valid task_detail.json found – falling back to default task detail")
+
+		projectName := "test"
+		focusName := "test"
+
+		projectsDir := filepath.Join(taskDir, "fuzz-tooling/projects/")
+		files, err := os.ReadDir(projectsDir)
+		if err == nil {
+			for _, file := range files {
+				if file.IsDir() {
+					projectName = file.Name()
+					focusName = "afc-" + projectName
+					log.Printf("Found project '%s' in fuzz-tooling/projects, setting focus to '%s'", projectName, focusName)
+					break // Use the first one
+				}
+			}
+		} else {
+			log.Printf("Could not read fuzz-tooling/projects/ directory: %v", err)
+		}
+
+		// Determine task type based on presence of "diff" directory
+		taskType := models.TaskTypeFull
+		diffPath := filepath.Join(taskDir, "diff")
+		if info, err := os.Stat(diffPath); err == nil && info.IsDir() {
+			taskType = models.TaskTypeDelta
+			log.Printf("Found 'diff' directory, setting task type to 'delta'")
+		} else {
+			log.Printf("No 'diff' directory found, setting task type to 'full'")
+		}
+
+		taskDetail = models.TaskDetail{
+			TaskID:            uuid.New(),
+			ProjectName:       projectName,
+			Focus:             focusName,
+			Type:              taskType,
+			Deadline:          time.Now().Add(time.Hour).Unix(),
+			HarnessesIncluded: true,
+			Metadata:          make(map[string]string),
+		}
+	}
     //----------------------------------------------------------
 
     // Get absolute paths
@@ -1019,7 +1093,7 @@ func fileExists(p string) bool {
 
 // prepareTaskEnvironment handles all task directory setup, source extraction, and fuzzer builds.
 // It returns the sanitizer directories and project configuration.
-func (s *defaultCRSService) prepareTaskEnvironment(
+func (s *defaultCRSService) prepareTaskEnvironment0(
     myFuzzer *string,
     taskDir string,
     taskDetail models.TaskDetail,
@@ -1325,6 +1399,79 @@ func (s *defaultCRSService) prepareTaskEnvironment(
     return cfg, sanitizerDirs, nil
 }
 
+func (s *defaultCRSService) prepareTaskEnvironment(
+	myFuzzer *string,
+	taskDir string,
+	taskDetail models.TaskDetail,
+	dockerfilePath string,
+	dockerfileFullPath string,
+	fuzzerDir string,
+	projectDir string,
+) (*ProjectConfig, []string, error) {
+	var cfg *ProjectConfig
+	var sanitizerDirs []string
+
+	projectYAMLPath := filepath.Join(dockerfilePath, "project.yaml")
+	cfg, err := loadProjectConfig(projectYAMLPath)
+	if err != nil {
+		log.Printf("Warning: Could not parse project.yaml (%v). Defaulting to address sanitizer.", err)
+		cfg = &ProjectConfig{Sanitizers: []string{"address"}}
+	}
+	if len(cfg.Sanitizers) == 0 {
+		log.Printf("No sanitizers listed in project.yaml; defaulting to address sanitizer.")
+		cfg.Sanitizers = []string{"address"}
+	}
+
+	// Build fuzzers for each sanitizer if they don't exist
+	for _, sanitizer := range cfg.Sanitizers {
+		if sanitizer == "undefined" {
+			continue
+		}
+		if *myFuzzer != "" && *myFuzzer != UNHARNESSED && !strings.Contains(*myFuzzer, sanitizer) {
+			continue
+		}
+		sanitizerDir := fuzzerDir + "-" + sanitizer
+		sanitizerDirs = append(sanitizerDirs, sanitizerDir)
+
+		fuzzers, _ := s.findFuzzers(sanitizerDir)
+		// if err != nil {
+		// 	log.Printf("Warning: problem trying to find fuzzers in %s: %v", sanitizerDir, err)
+		// }
+
+		if len(fuzzers) == 0 {
+			log.Printf("No fuzzers found in %s for sanitizer %s. Building...", sanitizerDir, sanitizer)
+			if err := s.buildFuzzersDocker(myFuzzer, taskDir, projectDir, sanitizerDir, sanitizer, cfg.Language, taskDetail); err != nil {
+				log.Printf("Error building fuzzers for sanitizer %s: %v", sanitizer, err)
+			}
+		} else {
+			log.Printf("Found %d fuzzers in %s. Skipping build.", len(fuzzers), sanitizerDir)
+		}
+	}
+
+	// Coverage for C/C++ worker fuzzers
+	if os.Getenv("LOCAL_TEST") != "" || *myFuzzer != "" {
+		lang := strings.ToLower(cfg.Language)
+		if lang == "c" || lang == "c++" {
+			san := "coverage"
+			sanDir := fuzzerDir
+			fuzzers, err := s.findFuzzers(sanDir)
+			if err != nil {
+				log.Printf("Warning: problem trying to find coverage fuzzers in %s: %v", sanDir, err)
+			}
+
+			if len(fuzzers) == 0 {
+				log.Printf("Building fuzzers with --sanitizer=%s", san)
+				if err := s.buildFuzzersDocker(myFuzzer, taskDir, projectDir, sanDir, san, cfg.Language, taskDetail); err != nil {
+					log.Printf("Error building fuzzers for sanitizer %s: %v", san, err)
+				}
+			} else {
+				log.Printf("Found %d coverage fuzzers in %s. Skipping build.", len(fuzzers), sanDir)
+			}
+		}
+	}
+
+	return cfg, sanitizerDirs, nil
+}    
 func (s *defaultCRSService) processTask(myFuzzer string, taskDetail models.TaskDetail, fullTask models.Task) error {
     taskID := taskDetail.TaskID.String()
     log.Printf("Processing task %s", taskID)
@@ -4463,6 +4610,7 @@ func (s *defaultCRSService) runSarifPOVStrategies(myFuzzer, taskDir, sarifFilePa
                 taskDetail.ProjectName,
                 taskDetail.Focus,
                 language,
+                "--model", s.model,
                 "--do-patch=false",
                 "--pov-metadata-dir", s.povAdvcancedMetadataDir,
                 "--check-patch-success",
@@ -4631,6 +4779,7 @@ func (s *defaultCRSService) runXPatchSarifStrategies(myFuzzer, taskDir, sarifFil
                 taskDetail.ProjectName,
                 taskDetail.Focus,
                 language,
+                "--model", s.model,
                 fmt.Sprintf("--patching-timeout=%d", patchingTimeout),
                 "--patch-workspace-dir", patchWorkDir,
             }
@@ -4742,7 +4891,7 @@ func (s *defaultCRSService) runAdvancedPOVStrategiesWithTimeout(
     phase int,
     roundNum int,
 ) bool {
-    strategyDir := "/app/strategy"
+    strategyDir := "/app/strategyx"
     strategyFilePattern := "as*_delta.py"
     if taskDetail.Type == "full" {
         strategyFilePattern = "as*_full.py"
@@ -4805,6 +4954,7 @@ func (s *defaultCRSService) runAdvancedPOVStrategiesWithTimeout(
                 taskDetail.ProjectName,
                 taskDetail.Focus,
                 language,
+                "--model", s.model,
                 "--do-patch=false",
                 "--pov-metadata-dir", s.povAdvcancedMetadataDir,
                 "--check-patch-success",
@@ -4827,7 +4977,7 @@ func (s *defaultCRSService) runAdvancedPOVStrategiesWithTimeout(
             }
 
             runCmd.Dir = taskDir
-            runCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // Kill process group on timeout
+            // runCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // Kill process group on timeout
 
             runCmd.Env = append(os.Environ(),
                 "VIRTUAL_ENV=/tmp/crs_venv",
@@ -4861,7 +5011,7 @@ func (s *defaultCRSService) runAdvancedPOVStrategiesWithTimeout(
                 return
             }
 
-            log.Printf("Running command: %s %s", pythonInterpreter, strings.Join(args, " "))
+            // log.Printf("Running command: %s %s", pythonInterpreter, strings.Join(args, " "))
             // log.Printf("With environment: %v", runCmd.Env)
 
 			startTime := time.Now()
@@ -5055,7 +5205,7 @@ func robustCopyDir(src, dst string) error {
             
             // Create a symlink at the destination with the same target
             if err := os.Symlink(linkTarget, dstPath); err != nil {
-                log.Printf("Warning: failed to create symlink %s -> %s: %v", dstPath, linkTarget, err)
+                // log.Printf("Warning: failed to create symlink %s -> %s: %v", dstPath, linkTarget, err)
                 copyErrors = append(copyErrors, fmt.Sprintf("error creating symlink %s: %v", dstPath, err))
                 // Continue despite the error
             }
@@ -5232,7 +5382,7 @@ func (s *defaultCRSService) runXPatchingStrategiesWithoutPOV(
         log.Printf("Patch workspace fuzzer path: %s", patchFuzzerPath)
         
         // Find all strategy files under /app/strategy/
-        strategyDir := "/app/strategy"
+        strategyDir := "/app/strategyx"
         strategyFilePattern := "xpatch*_delta.py"
         if taskDetail.Type == "full" {
             strategyFilePattern = "xpatch*_full.py"
@@ -5273,7 +5423,7 @@ func (s *defaultCRSService) runXPatchingStrategiesWithoutPOV(
                 
                 {
                     // Create a symbolic link to the .env file in the task directory
-                    envFilePath := filepath.Join("/app/strategy", ".env")
+                    envFilePath := filepath.Join("/app/strategyx", ".env")
                     targetEnvPath := filepath.Join(taskDir, ".env")
                     os.Symlink(envFilePath, targetEnvPath)
                 }
@@ -5290,6 +5440,7 @@ func (s *defaultCRSService) runXPatchingStrategiesWithoutPOV(
                     taskDetail.ProjectName,
                     taskDetail.Focus,
                     language,
+                    "--model", s.model,
                     fmt.Sprintf("--patching-timeout=%d", patchingTimeout),
                     "--patch-workspace-dir", patchWorkDir,
                 }
@@ -5368,7 +5519,12 @@ func (s *defaultCRSService) runXPatchingStrategiesWithoutPOV(
                 go func() {
                     scanner := bufio.NewScanner(stdoutPipe)
                     for scanner.Scan() {
-                        text := scanner.Text()
+                        raw := scanner.Text()
+                        // Keep only what would be visible in a terminal (after the last CR)
+                        text := raw
+                        if i := strings.LastIndex(raw, "\r"); i >= 0 {
+                            text = raw[i+1:]
+                        }
                         outputBuffer.WriteString(text + "\n")
                         log.Printf("[XPATCH][%s stdout] %s", strategyName, text)
                         
@@ -5388,7 +5544,12 @@ func (s *defaultCRSService) runXPatchingStrategiesWithoutPOV(
                 go func() {
                     scanner := bufio.NewScanner(stderrPipe)
                     for scanner.Scan() {
-                        text := scanner.Text()
+                        raw := scanner.Text()
+                        // Keep only what would be visible in a terminal (after the last CR)
+                        text := raw
+                        if i := strings.LastIndex(raw, "\r"); i >= 0 {
+                            text = raw[i+1:]
+                        }
                         outputBuffer.WriteString(text + "\n")
                         log.Printf("[XPATCH][%s stderr] %s", strategyName, text)
                     }
@@ -5399,6 +5560,8 @@ func (s *defaultCRSService) runXPatchingStrategiesWithoutPOV(
                 case err := <-done:
                     // Process completed
                     output := outputBuffer.String()
+                       // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
                     if err != nil {
                         log.Printf("[XPATCH] Strategy %s failed after %v: %v", strategyName, time.Since(startTime), err)
                         
@@ -5427,6 +5590,9 @@ func (s *defaultCRSService) runXPatchingStrategiesWithoutPOV(
                         syscall.Kill(-pgid, syscall.SIGKILL)
                     }
                     <-done // ensure Wait() returns
+
+                       // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
                     if patchCtx.Err() == context.DeadlineExceeded {
                         log.Printf("[XPATCH] %s timed out after %v",
                              strategyName, time.Since(startTime))
@@ -5575,7 +5741,7 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
     log.Printf("Patch workspace fuzzer path: %s", patchFuzzerPath)
     
     // Find all strategy files under /app/strategy/
-    strategyDir := "/app/strategy"
+    strategyDir := "/app/strategyx"
     strategyFilePattern := "patch*_delta.py"
     if taskDetail.Type == "full" {
         strategyFilePattern = "patch*_full.py"
@@ -5648,9 +5814,22 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
         roundCtx, cancel := context.WithTimeout(context.Background(), roundTimeoutDuration) // Context per round
         var wg sync.WaitGroup // WaitGroup per round
 
+        // install once, right after you create roundCtx
+        sigc := make(chan os.Signal, 1)
+        signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
+        go func() {
+            <-sigc
+            killAllChildren(syscall.SIGTERM)
+            time.Sleep(2 * time.Second)
+            killAllChildren(syscall.SIGKILL)
+            cancel()           // cancel roundCtx
+            fmt.Fprintln(log.Writer()) // newline so shell prompt is clean
+            os.Exit(1)         // exit the Go program itself
+        }()
+
         // patchFoundInRound := false // Track success specifically within this round
         // FIVE parallel instances for each patching strategy
-        PARALLEL_PATCH_TIMES := 2
+        PARALLEL_PATCH_TIMES := 1
         if os.Getenv("LOCAL_TEST") != "" {
             PARALLEL_PATCH_TIMES = 1
         }
@@ -5675,12 +5854,14 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                 defer wg.Done()
                 
                 strategyName := filepath.Base(strategyPath)
+                   // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
                 log.Printf("[Round %d] Running patching strategy: %s", roundNum, strategyPath)
                 
                 {
                     // Create a symbolic link to the .env file in the task directory
                     var symlinkCreationErr error
-                    envFilePath := filepath.Join("/app/strategy", ".env")
+                    envFilePath := filepath.Join("/app/strategyx", ".env")
                     targetEnvPath := filepath.Join(taskDir, ".env")
                     linkFi, errLstat := os.Lstat(targetEnvPath)
                     if errLstat == nil { // Path exists
@@ -5729,6 +5910,7 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                     taskDetail.ProjectName,
                     taskDetail.Focus,
                     language,
+                    "--model", s.model,
                     fmt.Sprintf("--patching-timeout=%d", patchingTimeout),
                     "--pov-metadata-dir", povMetadataDir,
                     "--patch-workspace-dir", patchWorkDir,
@@ -5777,7 +5959,7 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                         fmt.Sprintf("NEW_FUZZER_SRC_PATH=%s", srcAny.(string)))
                 }
                 // Log the command for debugging
-                log.Printf("[Round %d] Executing: %s", roundNum, runCmd.String())
+                // log.Printf("[Round %d] Executing: %s", roundNum, runCmd.String())
                 // Create pipes for stdout and stderr
                 stdoutPipe, err := runCmd.StdoutPipe()
                 if err != nil {
@@ -5794,6 +5976,12 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                     return
                 }
                 
+                // ─── Forward Ctrl-C (SIGINT) / SIGTERM to the child process-group ───
+                if runCmd.Process != nil {
+                    pgid, _ := syscall.Getpgid(runCmd.Process.Pid) // child's pgid == pid (Setpgid:true)
+                    registerChildPG(pgid)
+                }
+
                 // Buffer for output
                 var outputBuffer bytes.Buffer
                 
@@ -5807,21 +5995,34 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                 go func() {
                     scanner := bufio.NewScanner(stdoutPipe)
                     for scanner.Scan() {
-                        text := scanner.Text()
-                        outputBuffer.WriteString(text + "\n")
-                        log.Printf("[Round %d][basic %s stdout] %s", roundNum, strategyName, text)
-                        
-                        // Check for patch success in real-time
-                        if strings.Contains(text, "PATCH SUCCESS!") || 
-                        strings.Contains(text, "Successfully patched") {                        
-                            successMutex.Lock()
-                            if !patchSuccess { // Check again under lock
-                                patchSuccess = true
-                                // patchFoundInRound = true // Mark success for this round
-                                log.Printf("[Round %d] Patch success detected for %s! Cancelling other strategies in this round.", roundNum, strategyName)
-                                cancel() // Cancel the context for this round
+                        raw := scanner.Text()
+
+                        // Handle in-line carriage returns from progress bars, etc.
+                        for _, part := range strings.Split(raw, "\r") {
+                            part = sanitizeTerminalString(part)
+                            if part == "" {
+                                continue
                             }
-                            successMutex.Unlock()
+                               // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
+                            outputBuffer.WriteString(part + "\n")
+                            log.Printf("[Round %d][basic %s stdout] %s", roundNum, strategyName, part)
+
+                            // Check for patch success in real-time
+                            if strings.Contains(part, "PATCH SUCCESS!") ||
+                                strings.Contains(part, "Successfully patched") {
+
+                                successMutex.Lock()
+                                if !patchSuccess {
+                                    patchSuccess = true
+                                       // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
+                                    log.Printf("[Round %d] Patch success detected for %s! Cancelling other strategies in this round.",
+                                        roundNum, strategyName)
+                                    cancel()
+                                }
+                                successMutex.Unlock()
+                            }
                         }
                     }
                 }()
@@ -5829,9 +6030,18 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                 go func() {
                     scanner := bufio.NewScanner(stderrPipe)
                     for scanner.Scan() {
-                        text := scanner.Text()
-                        outputBuffer.WriteString(text + "\n")
-                        log.Printf("[Round %d][basic %s stderr] %s", roundNum, strategyName, text)
+                        raw := scanner.Text()
+
+                        for _, part := range strings.Split(raw, "\r") {
+                            part = sanitizeTerminalString(part)
+                            if part == "" {
+                                continue
+                            }
+                               // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
+                            outputBuffer.WriteString(part + "\n")
+                            log.Printf("[Round %d][basic %s stderr] %s", roundNum, strategyName, part)
+                        }
                     }
                 }()
                 
@@ -5840,6 +6050,10 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                 case err := <-done:
                     // Process completed
                     output := outputBuffer.String()
+
+                       // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
+
                     if err != nil {
                         log.Printf("[Round %d] Strategy %s failed after %v: %v", roundNum, strategyName, time.Since(startTime), err)
                         
@@ -5854,6 +6068,8 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                             if !patchSuccess {
                                 patchSuccess = true
                                 // patchFoundInRound = true
+                                   // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
                                 log.Printf("[Round %d] Patch success confirmed post-run for %s. (Cancellation might have already occurred).", roundNum, strategyName)
                                 // Don't necessarily cancel again, it might already be done.
                             }
@@ -5870,6 +6086,10 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
                         syscall.Kill(-pgid, syscall.SIGKILL)
                     }
                     <-done // ensure Wait() returns
+
+                       // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
+
                     if patchCtx.Err() == context.DeadlineExceeded {
                         log.Printf("[Round %d] %s timed out after %v",
                             roundNum, strategyName, time.Since(startTime))
@@ -5883,6 +6103,8 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
         
         // Wait for all strategies to complete
         wg.Wait()
+           // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
         log.Printf("Patching Attempt Round %d finished.", roundNum)
         // After the round finishes, check the global success flag again
         successMutex.Lock()
@@ -5890,6 +6112,8 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
         successMutex.Unlock()
 
         if finalRoundSuccessCheck {
+               // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
             log.Printf("Patch success confirmed after round %d. Exiting loop.", roundNum)
             break // Exit the main loop if patch was found in this round
         }
@@ -5899,17 +6123,22 @@ func (s *defaultCRSService) runPatchingStrategies(myFuzzer,taskDir string, proje
 
     } // --- End Patching Loop ---
 
+       // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
     log.Printf("Exiting patching strategies function.")
     // Return the final state of patchSuccess
     successMutex.Lock()
     finalResult := patchSuccess
     successMutex.Unlock()
+
+    fmt.Fprintln(log.Writer())   // ensure prompt starts on a fresh line
+
     return finalResult
 }
 
 func (s *defaultCRSService) runStrategies(myFuzzer, taskDir, projectDir, fuzzDir, language string, taskDetail models.TaskDetail, fullTask models.Task) bool {
     // Find all strategy files under /app/strategy/
-    strategyDir := "/app/strategy"
+    strategyDir := "/app/strategyx"
 
     strategyFilePattern := "xs*_delta.py"
     if taskDetail.Type == "full" {
@@ -5962,7 +6191,7 @@ func (s *defaultCRSService) runStrategies(myFuzzer, taskDir, projectDir, fuzzDir
             
             {
                 // Create a symbolic link to the .env file in the task directory
-                envFilePath := filepath.Join("/app/strategy", ".env")
+                envFilePath := filepath.Join("/app/strategyx", ".env")
                 targetEnvPath := filepath.Join(taskDir, ".env")
                 
                 // Remove existing symlink if it exists
@@ -5995,6 +6224,7 @@ func (s *defaultCRSService) runStrategies(myFuzzer, taskDir, projectDir, fuzzDir
                 taskDetail.ProjectName,
                 taskDetail.Focus,
                 language,
+                "--model", s.model,
                 "--pov-metadata-dir", s.povMetadataDir0,
                 "--check-patch-success",
             }
@@ -6019,7 +6249,7 @@ func (s *defaultCRSService) runStrategies(myFuzzer, taskDir, projectDir, fuzzDir
                 runCmd = exec.CommandContext(strategyCtx,pythonInterpreter, args...)
             }
             // Log the command for debugging
-            log.Printf("Executing command: %s", runCmd.String())
+            // log.Printf("Executing command: %s", runCmd.String())
             runCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
             runCmd.Dir = taskDir
             // Set environment variables that would be set by the virtual environment activation
@@ -6080,7 +6310,12 @@ func (s *defaultCRSService) runStrategies(myFuzzer, taskDir, projectDir, fuzzDir
             go func() {
                 scanner := bufio.NewScanner(stdoutPipe)
                 for scanner.Scan() {
-                    text := scanner.Text()
+                    raw := scanner.Text()
+                        // Keep only what would be visible in a terminal (after the last CR)
+                        text := raw
+                        if i := strings.LastIndex(raw, "\r"); i >= 0 {
+                            text = raw[i+1:]
+                        }
                     outputBuffer.WriteString(text + "\n")
                     log.Printf("[basic %s stdout] %s", strategyName, text)
                 }
@@ -6089,7 +6324,12 @@ func (s *defaultCRSService) runStrategies(myFuzzer, taskDir, projectDir, fuzzDir
             go func() {
                 scanner := bufio.NewScanner(stderrPipe)
                 for scanner.Scan() {
-                    text := scanner.Text()
+                    raw := scanner.Text()
+                        // Keep only what would be visible in a terminal (after the last CR)
+                        text := raw
+                        if i := strings.LastIndex(raw, "\r"); i >= 0 {
+                            text = raw[i+1:]
+                        }
                     outputBuffer.WriteString(text + "\n")
                     log.Printf("[basic %s stderr] %s", strategyName, text)
                 }
@@ -6561,6 +6801,10 @@ func waitForFile(filePath string, timeoutSeconds int) bool {
 }
 
 func (s *defaultCRSService) runLibFuzzer(myFuzzer,taskDir string, projectDir string, language string, taskDetail models.TaskDetail, fullTask models.Task) error {
+    if true {
+        log.Printf("Skipped [runLibFuzzer] for local testing: %s]", myFuzzer)
+        return nil
+    }
     // Create a span for fuzzer execution
     ctx := context.Background()
     _, fuzzerSpan := telemetry.StartSpan(ctx, "libfuzzer_execution")
@@ -6862,133 +7106,7 @@ FUZZ_LOOP:
     
     return nil
 }
-// RunStaticAnalysis runs the static analysis scan for full-scan mode
-// It returns after 5 minutes or when at least 5 vulnerabilities are found,
-// whichever comes first, but allows the scan to continue in the background.
-func RunStaticAnalysis(taskDir string, projectDir string) error {
-    log.Printf("Running static analysis for full-scan")
-    
-    suspectedVulnsPath := filepath.Join(taskDir, "suspected_vulns.json")
-    
-    // Create an empty file if it doesn't exist
-    if _, err := os.Stat(suspectedVulnsPath); os.IsNotExist(err) {
-        emptyVulns := []map[string]interface{}{}
-        vulnsData, _ := json.Marshal(emptyVulns)
-        if err := os.WriteFile(suspectedVulnsPath, vulnsData, 0644); err != nil {
-            log.Printf("Error creating empty suspected_vulns.json: %v", err)
-            return err
-        }
-    }
-    
-    // Create command to run the scan binary with incremental flag
-    scanCmd := exec.Command("/app/strategy/jeff/scan", 
-                           "-dir="+projectDir,
-                           "-suspect="+suspectedVulnsPath,
-                           "-incremental=true")
-    
-    // Set the working directory to the project directory
-    scanCmd.Dir = taskDir
-    
-    // Set environment variables
-    scanCmd.Env = os.Environ()
-    
-    // Create pipes for stdout and stderr
-    stdout, err := scanCmd.StdoutPipe()
-    if err != nil {
-        log.Printf("Error creating stdout pipe: %v", err)
-        return err
-    }
-    
-    stderr, err := scanCmd.StderrPipe()
-    if err != nil {
-        log.Printf("Error creating stderr pipe: %v", err)
-        return err
-    }
-    
-    // Start the command
-    log.Printf("Starting static analysis scan for project: %s", projectDir)
-    if err := scanCmd.Start(); err != nil {
-        log.Printf("Error starting scan: %v", err)
-        return err
-    }
-    
-    // Channel to signal when we should return
-    shouldReturn := make(chan struct{})
-    
-    // Read stdout in real-time and check for vulnerabilities
-    go func() {
-        scanner := bufio.NewScanner(stdout)
-        for scanner.Scan() {
-            line := scanner.Text()
-            // log.Printf("Scan output: %s", line)
-            
-            // Check if we have enough vulnerabilities to proceed
-            if strings.Contains(line, "Found suspicious") || strings.Contains(line, "Immediately saved suspicious") {
-                // Check the current count of vulnerabilities
-                vulnsData, err := os.ReadFile(suspectedVulnsPath)
-                if err == nil {
-                    var vulns []interface{}
-                    if err := json.Unmarshal(vulnsData, &vulns); err == nil {
-                        count := len(vulns)
-                        log.Printf("Currently have %d vulnerabilities", count)
-                        if count >= 5 {
-                            log.Printf("Found at least 5 vulnerabilities, signaling to proceed")
-                            close(shouldReturn) // Signal to return
-                            return
-                        }
-                    }
-                }
-            }
-        }
-    }()
-    
-    // Read stderr in real-time
-    go func() {
-        scanner := bufio.NewScanner(stderr)
-        for scanner.Scan() {
-            log.Printf("Scan error: %s", scanner.Text())
-        }
-    }()
-    
-    // Set up a timeout (5 minutes)
-    timeout := time.After(5 * time.Minute)
-    
-    // Wait for either:
-    // 1. Finding at least 5 vulnerabilities
-    // 2. Timeout (5 minutes)
-    select {
-    case <-shouldReturn:
-        log.Printf("Found at least 5 vulnerabilities, proceeding with strategy while scan continues")
-        
-    case <-timeout:
-        log.Printf("Scan timeout reached after 5 minutes, continuing with current results")
-    }
-    
-    // Check if we have any vulnerabilities
-    vulnsData, err := os.ReadFile(suspectedVulnsPath)
-    if err != nil {
-        log.Printf("Error reading suspected_vulns.json: %v", err)
-        return err
-    }
-    
-    var vulns []interface{}
-    if err := json.Unmarshal(vulnsData, &vulns); err != nil {
-        log.Printf("Error parsing suspected_vulns.json: %v", err)
-        return err
-    }
-    
-    vulnCount := len(vulns)
-    log.Printf("Found %d potential vulnerabilities so far", vulnCount)
-    
-    if vulnCount == 0 {
-        log.Printf("No vulnerabilities found yet, but scan continues in background")
-    }
-    
-    // Set up a file watcher to monitor for updates to the JSON file
-    go monitorVulnerabilityFile(suspectedVulnsPath)
-    
-    return nil
-}
+
 
 // monitorVulnerabilityFile watches the suspected_vulns.json file for changes
 // and logs updates as they occur
@@ -7240,15 +7358,15 @@ func copyFuzzDirForParallelStrategies(myFuzzer,fuzzDir string) error {
     isRoot := getEffectiveUserID() == 0
     if !isRoot {
         // Fix permissions using sudo
-        log.Printf("Current permissions on %s: %v", fuzzDir, info.Mode().Perm())
-        log.Printf("Attempting to fix permissions using sudo...")
+        // log.Printf("Current permissions on %s: %v", fuzzDir, info.Mode().Perm())
+        // log.Printf("Attempting to fix permissions using sudo...")
     
         // Use sudo to change ownership and permissions
         chownCmd := exec.Command("sudo", "chown", "-R", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), fuzzDir)
         if err := chownCmd.Run(); err != nil {
             log.Printf("Warning: Failed to change ownership with sudo: %v", err)
         } else {
-            log.Printf("Successfully changed ownership of %s", fuzzDir)
+            // log.Printf("Successfully changed ownership of %s", fuzzDir)
         }
     
         // Change permissions
@@ -7256,20 +7374,20 @@ func copyFuzzDirForParallelStrategies(myFuzzer,fuzzDir string) error {
         if err := chmodCmd.Run(); err != nil {
             log.Printf("Warning: Failed to change permissions with sudo: %v", err)
         } else {
-            log.Printf("Successfully changed permissions of %s", fuzzDir)
+            // log.Printf("Successfully changed permissions of %s", fuzzDir)
         }
     
         // List contents of source directory for debugging
-        files, err := os.ReadDir(fuzzDir)
-        if err != nil {
-            log.Printf("Error reading source directory contents: %v", err)
-            return fmt.Errorf("error reading source directory contents: %w", err)
-        }
+        // files, err := os.ReadDir(fuzzDir)
+        // if err != nil {
+        //     log.Printf("Error reading source directory contents: %v", err)
+        //     return fmt.Errorf("error reading source directory contents: %w", err)
+        // }
     
-        log.Printf("Source directory contains %d items:", len(files))
-        for _, file := range files {
-            log.Printf("  - %s (isDir: %v)", file.Name(), file.IsDir())
-        }
+        // log.Printf("Source directory contains %d items:", len(files))
+        // for _, file := range files {
+        //     log.Printf("  - %s (isDir: %v)", file.Name(), file.IsDir())
+        // }
     }
 
     for _, targetDir := range targetDirs {
@@ -7341,17 +7459,22 @@ func copyFuzzDirForParallelStrategies(myFuzzer,fuzzDir string) error {
 }
 
 func (s *defaultCRSService) runFuzzing(myFuzzer,taskDir string, taskDetail models.TaskDetail, fullTask models.Task, cfg *ProjectConfig, allFuzzers []string) error {
+    log.Printf("runFuzzing: myFuzzer: %s, taskDir: %s, taskDetail: %v, fullTask: %v, cfg: %v, allFuzzers: %v", myFuzzer, taskDir, taskDetail, fullTask, cfg, allFuzzers)
 
     if os.Getenv("LOCAL_TEST") != "" {
         s.workerIndex = "0"
         s.submissionEndpoint = "http://localhost:7081"
         myFuzzer = allFuzzers[0]
+
         for _, f := range allFuzzers {
-            if strings.HasSuffix(f, "libxml2-address/html") ||  strings.HasSuffix(f, "zookeeper-address/MessageTrackerPeekReceivedFuzzer") ||  strings.HasSuffix(f, "apache-commons-compress-address/CompressZipFuzzer")  ||  strings.HasSuffix(f, "sqlite3-address/customfuzz3")  {
+            if strings.HasSuffix(f, cfg.Fuzzer) {
                 myFuzzer = f
                 break
             }
         }
+
+        log.Printf("runFuzzing: myFuzzer: %s", myFuzzer)
+
     }
 
     // for crs-worker: send each fuzzer to a worker node
@@ -7455,7 +7578,8 @@ func (s *defaultCRSService) runFuzzing(myFuzzer,taskDir string, taskDetail model
                     s.runLibFuzzer(myFuzzer, taskDir, projectDir, cfg.Language, taskDetail, fullTask)
                 } ()
             }
-            go func() {
+            
+            // go func() {
                 log.Printf("BASIC PHASE started...")
                 // 30 mins
                 _, basicPhasesSpan := telemetry.StartSpan(ctx, "llm_basic_phase")
@@ -7467,12 +7591,13 @@ func (s *defaultCRSService) runFuzzing(myFuzzer,taskDir string, taskDetail model
                 defer basicPhasesSpan.End()
 
                 if os.Getenv("FUZZER_TEST") == "" {
-                    pov_success = s.runStrategies(myFuzzer,taskDir, projectDir, fuzzDir, cfg.Language, taskDetail, fullTask)
-                } else {
-                    // for testing and then exit
-                    s.runLibFuzzer(myFuzzer,taskDir, projectDir, cfg.Language, taskDetail, fullTask)
-                    os.Exit(0)
+                     pov_success = s.runStrategies(myFuzzer,taskDir, projectDir, fuzzDir, cfg.Language, taskDetail, fullTask)
+                } else {    
+                     // for testing and then exit
+                     s.runLibFuzzer(myFuzzer,taskDir, projectDir, cfg.Language, taskDetail, fullTask)
+                     os.Exit(0)
                 }
+                
                 if pov_success {
                     povFound.Do(func() { close(povChan) })
                 } else {
@@ -7483,7 +7608,7 @@ func (s *defaultCRSService) runFuzzing(myFuzzer,taskDir string, taskDetail model
                         } ()
                     }
                 }
-            }()
+            // }()
 
              // Calculate time budget based on deadline
              deadlineTime := time.Unix(taskDetail.Deadline/1000, 0)
@@ -7827,6 +7952,8 @@ func (s *defaultCRSService) runFuzzing(myFuzzer,taskDir string, taskDetail model
                 return errors.New("Failed to find POV within deadline")
             }
 
+               // instead of io.WriteString(log.Writer(), "\r")
+   io.WriteString(log.Writer(), "\r\033[K")
             if patch_success {
                 log.Printf("JOB DONE! %s", myFuzzer)
                 return nil
